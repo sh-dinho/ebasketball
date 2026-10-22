@@ -1,0 +1,1 @@
+-- Canonical database schema; existing files are preserved.

@@ -1,0 +1,1 @@
+"""Coordinate source ingestion."""

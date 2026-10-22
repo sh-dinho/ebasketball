@@ -1,0 +1,1 @@
+"""Backup AceOdds schedule adapter."""
