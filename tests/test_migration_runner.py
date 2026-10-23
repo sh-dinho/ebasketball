@@ -7,13 +7,13 @@ from pathlib import Path
 import pytest
 
 from ebasketball.migrations import (
+    _LOCK_KEY,
+    _LOCK_NAMESPACE,
     Migration,
     MigrationDriftError,
     MigrationError,
     MigrationSafetyError,
     MigrationStatus,
-    _LOCK_KEY,
-    _LOCK_NAMESPACE,
     _advisory_lock,
     _render_status,
     _validate_ledger,
@@ -42,7 +42,9 @@ def test_discovery_sorts_by_numeric_version_and_hashes_exact_contents(tmp_path):
     assert "COMMIT;" not in found[0].sql
 
 
-@pytest.mark.parametrize("filename", ["initial.sql", "x_bad.sql", "0_zero.sql", "1_Bad.sql"])
+@pytest.mark.parametrize(
+    "filename", ["initial.sql", "x_bad.sql", "0_zero.sql", "1_Bad.sql"]
+)
 def test_discovery_rejects_invalid_migration_filename(tmp_path, filename):
     _write_migration(tmp_path, filename)
     with pytest.raises(MigrationError, match="filename|version"):
@@ -67,6 +69,15 @@ def test_ledger_drift_is_reported(record, message):
     migration = Migration(1, "001_example.sql", "original", "SELECT 1;")
     with pytest.raises(MigrationDriftError, match=message):
         _validate_ledger([migration], {1: record})
+
+
+def test_known_legacy_initial_migration_checksum_is_preserved():
+    """The exact temporary 001 checksum remains readable, not rewritten."""
+    migration = Migration(1, "001_initial_schema.sql", "canonical", "SELECT 1;")
+    legacy_checksum = "1ea74cc77b567d8e773aa9c8e604d65a3624de5762487eb400d55839e3085c1c"
+    applied = {1: {"filename": migration.filename, "checksum": legacy_checksum}}
+    _validate_ledger([migration], applied)
+    assert applied[1]["checksum"] == legacy_checksum
 
 
 class _SafetyCursor:
@@ -190,13 +201,12 @@ def test_advisory_lock_prevents_another_session_from_acquiring_it(
         os.environ["EBASKETBALL_TEST_DSN"], cursor_factory=RealDictCursor
     )
     try:
-        with _advisory_lock(conn):
-            with second.cursor() as cursor:
-                cursor.execute(
-                    "SELECT pg_try_advisory_lock(%s, %s) AS acquired",
-                    (_LOCK_NAMESPACE, _LOCK_KEY),
-                )
-                assert cursor.fetchone()["acquired"] is False
+        with _advisory_lock(conn), second.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_try_advisory_lock(%s, %s) AS acquired",
+                (_LOCK_NAMESPACE, _LOCK_KEY),
+            )
+            assert cursor.fetchone()["acquired"] is False
         second.rollback()
     finally:
         second.close()

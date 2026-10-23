@@ -6,15 +6,14 @@ import json
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
+import psycopg2
 import pytest
 
 from ebasketball.ingestion.pipeline import run_ingestion
 from ebasketball.sources.json_file import JsonFileAdapter
-
 
 BASE_TIME = datetime(2026, 10, 22, 18, 30, tzinfo=timezone.utc)
 
@@ -44,7 +43,7 @@ def record(**updates):
     }
 
 
-def test_multiple_sources_reconcile_and_keep_source_odds_provenance():
+def test_multiple_sources_reconcile_and_keep_fixture_provenance():
     h2h_record = record(
         event_id="h2h-provider-42",
         source_url="https://h2h.example/events/42",
@@ -97,23 +96,56 @@ def test_multiple_sources_reconcile_and_keep_source_odds_provenance():
     assert [item.args[1] for item in save.call_args_list] == ["h2hgg", "aceodds"]
     saved_fixtures = [item.args[0] for item in save.call_args_list]
     assert saved_fixtures[0]["match_time"] == saved_fixtures[1]["match_time"]
-    assert saved_fixtures[0]["home_moneyline"] == Decimal("1.95")
-    assert saved_fixtures[1]["home_moneyline"] == Decimal("2.10")
-    assert saved_fixtures[0]["odds_observed_at"] == datetime(
-        2026, 10, 22, 18, 29, tzinfo=timezone.utc
-    )
+    assert "home_moneyline" not in saved_fixtures[0]
+    assert "odds_observed_at" not in saved_fixtures[0]
     assert save.call_args_list[0].kwargs["source_event_id"] == "h2h-provider-42"
-    assert save.call_args_list[0].kwargs["source_url"] == "https://h2h.example/events/42"
+    assert (
+        save.call_args_list[0].kwargs["source_url"] == "https://h2h.example/events/42"
+    )
     assert save.call_args_list[1].kwargs["source_event_id"] == "ace-1"
-    assert save.call_args_list[1].kwargs["source_url"] == "https://ace.example/matches/ace-901"
+    assert (
+        save.call_args_list[1].kwargs["source_url"]
+        == "https://ace.example/matches/ace-901"
+    )
+
+
+def test_reversed_cross_source_fixture_swaps_players_and_scores_consistently():
+    first = record(status="Completed", home_score=91, away_score=80)
+    reversed_record = record(
+        event_id="ace-reversed",
+        home_handle="PLAYER_B",
+        away_handle="PLAYER_A",
+        home_team="Team B",
+        away_team="Team A",
+        home_score=80,
+        away_score=91,
+    )
+    saved = []
+    with patch(
+        "ebasketball.ingestion.pipeline.save_fixture",
+        side_effect=lambda fixture, *_args, **_kwargs: (
+            saved.append(dict(fixture))
+            or {"id": 1, "inserted": len(saved) == 1, "updated": len(saved) > 1}
+        ),
+    ):
+        summary = run_ingestion(
+            [
+                MemoryAdapter("h2hgg", [first]),
+                MemoryAdapter("aceodds", [reversed_record]),
+            ]
+        )
+
+    assert summary.reconciled == 2
+    assert len(saved) == 2
+    assert all(row["home_handle"] == "PLAYER_A" for row in saved)
+    assert all(row["away_handle"] == "PLAYER_B" for row in saved)
+    assert all(row["home_score"] == 91 and row["away_score"] == 80 for row in saved)
 
 
 @pytest.mark.parametrize("score", [-1, 1.5])
 def test_invalid_scores_are_reported_as_record_failures(score):
     with patch("ebasketball.ingestion.pipeline.save_fixture") as save:
-        summary = run_ingestion(
-            [MemoryAdapter("h2hgg", [record(home_score=score)])]
-        )
+        summary = run_ingestion([MemoryAdapter("h2hgg", [record(home_score=score)])])
     save.assert_not_called()
     assert summary.fetched == 1
     assert summary.normalized == 0
@@ -152,9 +184,7 @@ def test_partial_source_timeout_processes_records_already_yielded():
         "ebasketball.ingestion.pipeline.save_fixture",
         return_value={"inserted": True, "updated": False},
     ) as save:
-        summary = run_ingestion(
-            [MemoryAdapter("h2hgg", records_then_timeout())]
-        )
+        summary = run_ingestion([MemoryAdapter("h2hgg", records_then_timeout())])
     assert summary.fetched == 1
     assert summary.source_failures
     assert summary.inserted == 1
@@ -216,8 +246,9 @@ def test_unrelated_fixtures_remain_separate():
     assert summary.skipped == 0
     assert save.call_count == 2
     assert [item.args[1] for item in save.call_args_list] == ["h2hgg", "aceodds"]
-    assert save.call_args_list[0].args[0]["match_time"] != (
-        save.call_args_list[1].args[0]["match_time"]
+    assert (
+        save.call_args_list[0].args[0]["match_time"]
+        != (save.call_args_list[1].args[0]["match_time"])
     )
 
 
@@ -243,7 +274,7 @@ def test_database_failure_is_counted_per_record_and_other_records_continue():
     with patch(
         "ebasketball.ingestion.pipeline.save_fixture",
         side_effect=[
-            RuntimeError("database unavailable"),
+            psycopg2.OperationalError("database unavailable"),
             {"inserted": True, "updated": False},
         ],
     ) as save:
@@ -257,9 +288,7 @@ def test_database_failure_is_counted_per_record_and_other_records_continue():
         )
     assert summary.failed == 1
     assert summary.inserted == 1
-    assert [item["stage"] for item in summary.errors if "stage" in item] == [
-        "persist"
-    ]
+    assert [item["stage"] for item in summary.errors if "stage" in item] == ["persist"]
     assert save.call_count == 2
 
 
@@ -268,9 +297,7 @@ def test_dry_run_never_calls_persistence_or_opens_connection():
         patch("ebasketball.ingestion.pipeline.save_fixture") as save,
         patch("ebasketball.ingestion.pipeline.get_connection") as get_connection,
     ):
-        summary = run_ingestion(
-            [MemoryAdapter("h2hgg", [record()])], dry_run=True
-        )
+        summary = run_ingestion([MemoryAdapter("h2hgg", [record()])], dry_run=True)
     save.assert_not_called()
     get_connection.assert_not_called()
     assert summary.normalized == 1
@@ -281,7 +308,7 @@ def test_json_file_adapter_requires_a_top_level_array(tmp_path):
     source_file = tmp_path / "records.json"
     source_file.write_text('{"record": true}', encoding="utf-8")
     adapter = JsonFileAdapter("h2hgg", source_file)
-    with pytest.raises(ValueError, match="top-level array"):
+    with pytest.raises(TypeError, match="top-level array"):
         list(adapter.fetch_records())
 
 
@@ -295,7 +322,6 @@ def test_cli_runs_a_dry_run_from_json_without_database_configuration(tmp_path):
             str(project_root / "scripts" / "run_ingestion.py"),
             "--input",
             f"h2hgg={input_path}",
-            "--dry-run",
         ],
         cwd=project_root,
         capture_output=True,
@@ -308,3 +334,37 @@ def test_cli_runs_a_dry_run_from_json_without_database_configuration(tmp_path):
     assert summary["fetched"] == 1
     assert summary["normalized"] == 1
     assert summary["dry_run"] is True
+
+
+def test_cli_persistence_requires_explicit_opt_in(monkeypatch, capsys, tmp_path):
+    from scripts import run_ingestion as cli
+
+    input_file = tmp_path / "fixtures.json"
+    input_file.write_text("[]", encoding="utf-8")
+    observed = []
+
+    class Summary:
+        def __init__(self):
+            self.failed = 0
+            self.source_failures = []
+            self.errors = []
+
+        def to_dict(self):
+            return {"dry_run": observed[-1]}
+
+    monkeypatch.setattr(
+        cli,
+        "run_ingestion",
+        lambda adapters, *, dry_run: observed.append(dry_run) or Summary(),
+    )
+    assert cli.main(["--input", f"h2hgg={input_file}"]) == 0
+    assert observed[-1] is True
+    assert json.loads(capsys.readouterr().out)["dry_run"] is True
+
+    assert cli.main(["--input", f"h2hgg={input_file}", "--persist"]) == 0
+    assert observed[-1] is False
+    assert json.loads(capsys.readouterr().out)["dry_run"] is False
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["--input", f"h2hgg={input_file}", "--persist", "--dry-run"])
+    assert exc_info.value.code == 2

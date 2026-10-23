@@ -53,10 +53,7 @@ def test_matching_fixtures_allow_small_time_difference(
 ):
     second = {
         **fixture_a,
-        "match_time": (
-            fixture_a["match_time"]
-            + timedelta(seconds=120)
-        ),
+        "match_time": (fixture_a["match_time"] + timedelta(seconds=120)),
         "home_handle": " playera ",
         "away_handle": "PLAYERB",
     }
@@ -73,14 +70,14 @@ def test_different_players_do_not_match(fixture_a):
     assert not fixtures_match(fixture_a, second)
 
 
-def test_reversed_players_do_not_match(fixture_a):
+def test_reversed_players_match_as_same_fixture(fixture_a):
     second = {
         **fixture_a,
         "home_handle": "PlayerB",
         "away_handle": "PlayerA",
     }
 
-    assert not fixtures_match(fixture_a, second)
+    assert fixtures_match(fixture_a, second)
 
 
 def test_large_time_difference_does_not_match(
@@ -88,10 +85,7 @@ def test_large_time_difference_does_not_match(
 ):
     second = {
         **fixture_a,
-        "match_time": (
-            fixture_a["match_time"]
-            + timedelta(minutes=10)
-        ),
+        "match_time": (fixture_a["match_time"] + timedelta(minutes=10)),
     }
 
     assert not fixtures_match(fixture_a, second)
@@ -135,25 +129,22 @@ def test_reconcile_groups_two_sources(
 ):
     second = {
         **fixture_a,
-        "match_time": (
-            fixture_a["match_time"]
-            + timedelta(seconds=30)
-        ),
+        "match_time": (fixture_a["match_time"] + timedelta(seconds=30)),
     }
 
-    result = reconcile_fixtures({
-        "h2hgg": [fixture_a],
-        "aceodds": [second],
-    })
+    result = reconcile_fixtures(
+        {
+            "h2hgg": [fixture_a],
+            "aceodds": [second],
+        }
+    )
 
     assert len(result["groups"]) == 1
     assert result["groups"][0]["sources"] == [
         "aceodds",
         "h2hgg",
     ]
-    assert len(
-        result["groups"][0]["records"]
-    ) == 2
+    assert len(result["groups"][0]["records"]) == 2
 
     # R1 regression:
     # matched fixtures must not remain unmatched.
@@ -168,10 +159,12 @@ def test_reconcile_keeps_distinct_fixtures_separate(
         "away_handle": "PlayerC",
     }
 
-    result = reconcile_fixtures({
-        "h2hgg": [fixture_a],
-        "aceodds": [second],
-    })
+    result = reconcile_fixtures(
+        {
+            "h2hgg": [fixture_a],
+            "aceodds": [second],
+        }
+    )
 
     assert len(result["groups"]) == 2
     assert len(result["unmatched"]) == 2
@@ -189,15 +182,15 @@ def test_previously_matched_fixture_is_not_unmatched():
         is True
     )
 
-    result = reconcile_fixtures({
-        "h2hgg": [fixture_a],
-        "aceodds": [fixture_b],
-    })
+    result = reconcile_fixtures(
+        {
+            "h2hgg": [fixture_a],
+            "aceodds": [fixture_b],
+        }
+    )
 
     assert len(result["groups"]) == 1
-    assert len(
-        result["groups"][0]["records"]
-    ) == 2
+    assert len(result["groups"][0]["records"]) == 2
     assert result["unmatched"] == []
 
 
@@ -209,22 +202,20 @@ def test_truly_unmatched_fixtures():
         away="Player D",
     )
 
-    result = reconcile_fixtures({
-        "h2hgg": [
-            fixture_a,
-            fixture_b,
-        ],
-    })
+    result = reconcile_fixtures(
+        {
+            "h2hgg": [
+                fixture_a,
+                fixture_b,
+            ],
+        }
+    )
 
     assert len(result["groups"]) == 2
     assert len(result["unmatched"]) == 2
 
-    assert len(
-        result["groups"][0]["records"]
-    ) == 1
-    assert len(
-        result["groups"][1]["records"]
-    ) == 1
+    assert len(result["groups"][0]["records"]) == 1
+    assert len(result["groups"][1]["records"]) == 1
 
 
 def test_transitive_matching_uses_any_record_in_group():
@@ -267,9 +258,7 @@ def test_transitive_matching_uses_any_record_in_group():
 
     assert len(result["groups"]) == 1
 
-    assert len(
-        result["groups"][0]["records"]
-    ) == 3
+    assert len(result["groups"][0]["records"]) == 3
 
     assert result["groups"][0]["sources"] == [
         "aceodds",
@@ -338,24 +327,13 @@ def test_ambiguous_candidate_does_not_modify_groups():
     assert len(result["groups"]) == 2
 
     assert len(result["ambiguous"]) == 1
-    assert (
-        result["ambiguous"][0]["fixture"]
-        is candidate
-    )
+    assert result["ambiguous"][0]["fixture"] is candidate
 
-    assert len(
-        result["groups"][0]["records"]
-    ) == 1
+    assert len(result["groups"][0]["records"]) == 1
 
-    assert len(
-        result["groups"][1]["records"]
-    ) == 1
+    assert len(result["groups"][1]["records"]) == 1
 
     assert all(
-        candidate
-        not in (
-            record["fixture"]
-            for record in group["records"]
-        )
+        candidate not in (record["fixture"] for record in group["records"])
         for group in result["groups"]
     )

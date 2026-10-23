@@ -1,4 +1,3 @@
-
 """Preview or persist a historical backfill from an offline export."""
 
 from __future__ import annotations
@@ -7,28 +6,38 @@ import argparse
 import json
 import sys
 from datetime import date
+from itertools import pairwise
 from pathlib import Path
 
 from ebasketball.ingestion.backfill import (
     DEFAULT_BATCH_SIZE,
-    FileImportSource,
     MAX_BATCH_SIZE,
+    FileImportSource,
     run_adaptive_backfill,
     run_backfill,
 )
+from ebasketball.sources.live import LiveProviderUnavailable, require_live_provider
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Backfill completed fixtures from an offline JSON/CSV export. "
-            "No live provider fetching is implemented by this CLI."
+            "Backfill completed fixtures. Live collection is disabled until "
+            "an official provider API is verified; pass --input for an offline export."
         )
     )
     parser.add_argument("--source", required=True, choices=("h2hgg", "aceodds"))
-    parser.add_argument("--input", required=True, type=Path)
-    parser.add_argument("--start-date", type=date.fromisoformat, default=date(2026, 7, 25))
-    parser.add_argument("--end-date", type=date.fromisoformat, default=date(2026, 10, 23))
+    parser.add_argument(
+        "--input",
+        type=Path,
+        help="Offline JSON/CSV export. Omit to request live collection (currently disabled).",
+    )
+    parser.add_argument(
+        "--start-date", type=date.fromisoformat, default=date(2026, 7, 25)
+    )
+    parser.add_argument(
+        "--end-date", type=date.fromisoformat, default=date(2026, 10, 23)
+    )
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--retry-delay", type=float, default=1.0)
@@ -58,6 +67,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--max-retries and --retry-delay must be nonnegative")
 
     try:
+        if args.input is None:
+            require_live_provider(args.source)
         source = FileImportSource(args.source, args.input)
 
         def report_progress(item):
@@ -89,6 +100,9 @@ def main(argv: list[str] | None = None) -> int:
                 **kwargs,
             )
 
+    except LiveProviderUnavailable as exc:
+        print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}), file=sys.stderr)
+        return 3
     except (OSError, ValueError, RuntimeError) as exc:
         print(
             json.dumps({"error": f"{type(exc).__name__}: {exc}"}),
@@ -97,21 +111,28 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     print(json.dumps(summary.to_dict(), indent=2, sort_keys=True))
-    return 1 if (
-        summary.failed or summary.provider_failures or not summary.complete
-        or summary.fetched == 0
-    ) else 0
+    if summary.provider_failures or any(
+        error.get("stage") in {"persist", "reconcile", "checkpoint"}
+        for error in summary.errors
+        if isinstance(error, dict)
+    ):
+        return 3
+    return 1 if summary.failed or not summary.complete or summary.fetched == 0 else 0
 
 
 def _parse_window_sizes(value: str) -> tuple[int, ...]:
     try:
         sizes = tuple(int(item) for item in value.split(","))
     except ValueError as exc:
-        raise argparse.ArgumentTypeError("window sizes must be comma-separated integers") from exc
+        raise argparse.ArgumentTypeError(
+            "window sizes must be comma-separated integers"
+        ) from exc
     if not sizes or any(size <= 0 for size in sizes):
         raise argparse.ArgumentTypeError("window sizes must be positive")
-    if any(left <= right for left, right in zip(sizes, sizes[1:])):
-        raise argparse.ArgumentTypeError("window sizes must be in strictly decreasing order")
+    if any(left <= right for left, right in pairwise(sizes)):
+        raise argparse.ArgumentTypeError(
+            "window sizes must be in strictly decreasing order"
+        )
     return sizes
 
 

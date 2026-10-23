@@ -10,12 +10,14 @@ from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from psycopg2 import Error as PsycopgError
+
 from ebasketball.database import get_connection
 from ebasketball.ingestion.normalize import normalize_fixture
 from ebasketball.ingestion.reconcile import reconcile_fixtures
 from ebasketball.repositories.matches import upsert_match
-from ebasketball.repositories.odds import record_fixture_odds
 from ebasketball.sources.interface import SourceAdapter
+from ebasketball.sources.live import LiveProviderUnavailable
 
 _SUPPORTED_SOURCES = {"h2hgg", "aceodds"}
 _DATABASE_URL = re.compile(r"postgres(?:ql)?://[^\s\"']+", re.IGNORECASE)
@@ -31,8 +33,8 @@ class IngestionRunSummary:
     ``normalized`` counts records that normalized successfully, before exact
     duplicate filtering. ``reconciled`` counts nonduplicate records assigned
     to a group containing more than one source; ambiguous records are excluded.
-    ``inserted`` and ``updated`` count persisted match upserts, not odds rows;
-    both stay zero in dry-run mode. ``skipped`` counts exact repeated inputs
+    ``inserted`` and ``updated`` count persisted match upserts; both stay zero
+    in dry-run mode. ``skipped`` counts exact repeated inputs
     and records with ambiguous reconciliation candidates. ``failed`` counts
     individual normalization, reconciliation, or persistence failures.
     Adapter-level failures are listed in ``source_failures`` and do not
@@ -65,9 +67,7 @@ def _safe_error(exc: Exception) -> str:
 
 
 def _raw_hash(raw: Mapping[str, Any]) -> str:
-    serialized = json.dumps(
-        raw, sort_keys=True, default=str, separators=(",", ":")
-    )
+    serialized = json.dumps(raw, sort_keys=True, default=str, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
@@ -80,7 +80,7 @@ def save_fixture(
     source_match_key: str | None = None,
     raw_hash: str | None = None,
 ) -> dict[str, Any]:
-    """Persist a fixture, provenance, and source-specific odds atomically."""
+    """Persist a fixture and source provenance atomically."""
     with get_connection() as conn:
         upsert_result = upsert_match(
             conn,
@@ -93,18 +93,10 @@ def save_fixture(
             return_status=True,
         )
         assert isinstance(upsert_result, dict)
-        observations_inserted = record_fixture_odds(
-            conn,
-            upsert_result["id"],
-            fixture,
-            source,
-        )
-
     return {
         "match_id": upsert_result["id"],
         "inserted": upsert_result["inserted"],
         "updated": not upsert_result["inserted"],
-        "odds_observations_inserted": observations_inserted,
         "source": source,
     }
 
@@ -135,7 +127,7 @@ def _persistable_records(
             for raw in records:
                 raw_records.append(raw)
                 summary.fetched += 1
-        except Exception as exc:
+        except (OSError, TypeError, ValueError, LiveProviderUnavailable) as exc:
             summary.source_failures.append(
                 {"source": source, "error": _safe_error(exc)}
             )
@@ -147,7 +139,7 @@ def _persistable_records(
                 fixture = normalize_fixture(raw, source)
                 fingerprint = _raw_hash(raw)
                 summary.normalized += 1
-            except Exception as exc:
+            except (TypeError, ValueError) as exc:
                 summary.failed += 1
                 summary.errors.append(
                     {
@@ -212,16 +204,12 @@ def run_ingestion(
             reconciliation_input,
             tolerance_seconds=tolerance_seconds,
         )
-    except Exception as exc:
+    except (TypeError, ValueError) as exc:
         all_records = [
-            record
-            for records in fixtures_by_source.values()
-            for record in records
+            record for records in fixtures_by_source.values() for record in records
         ]
         summary.failed += len(all_records)
-        summary.errors.append(
-            {"stage": "reconcile", "error": _safe_error(exc)}
-        )
+        summary.errors.append({"stage": "reconcile", "error": _safe_error(exc)})
         return summary
 
     prepared_by_fixture = {
@@ -229,10 +217,7 @@ def run_ingestion(
         for records in fixtures_by_source.values()
         for record in records
     }
-    ambiguous_ids = {
-        id(record["fixture"])
-        for record in reconciled["ambiguous"]
-    }
+    ambiguous_ids = {id(record["fixture"]) for record in reconciled["ambiguous"]}
     for ambiguous in reconciled["ambiguous"]:
         prepared = prepared_by_fixture[id(ambiguous["fixture"])]
         summary.skipped += 1
@@ -249,10 +234,7 @@ def run_ingestion(
         for group in reconciled["groups"]
         if len(group["records"]) > 1
     )
-    summary.errors.extend(
-        {"stage": "skip", **item}
-        for item in skipped
-    )
+    summary.errors.extend({"stage": "skip", **item} for item in skipped)
 
     if dry_run:
         return summary
@@ -266,17 +248,48 @@ def run_ingestion(
         if not group_records:
             continue
 
-        canonical = min(
+        canonical_record = min(
             group_records,
             key=lambda item: (
                 item["fixture"]["match_time"],
                 item["source"],
                 item["fixture"].get("source_event_id") or "",
             ),
-        )["fixture"]["match_time"]
+        )
+        canonical_fixture = dict(canonical_record["fixture"])
+        if (
+            canonical_fixture["home_handle"].casefold()
+            > canonical_fixture["away_handle"].casefold()
+        ):
+            for left, right in (
+                ("home_handle", "away_handle"),
+                ("home_team", "away_team"),
+                ("home_score", "away_score"),
+            ):
+                canonical_fixture[left], canonical_fixture[right] = (
+                    canonical_fixture.get(right),
+                    canonical_fixture.get(left),
+                )
+        canonical = canonical_fixture["match_time"]
 
         for record in group_records:
             fixture = {**record["fixture"], "match_time": canonical}
+            reversed_orientation = (
+                fixture["home_handle"].casefold()
+                == canonical_fixture["away_handle"].casefold()
+                and fixture["away_handle"].casefold()
+                == canonical_fixture["home_handle"].casefold()
+            )
+            if reversed_orientation:
+                for left, right in (
+                    ("home_handle", "away_handle"),
+                    ("home_team", "away_team"),
+                    ("home_score", "away_score"),
+                ):
+                    fixture[left], fixture[right] = (
+                        fixture.get(right),
+                        fixture.get(left),
+                    )
             try:
                 outcome = save_fixture(
                     fixture,
@@ -288,7 +301,7 @@ def run_ingestion(
                 )
                 summary.inserted += int(outcome["inserted"])
                 summary.updated += int(outcome["updated"])
-            except Exception as exc:
+            except (PsycopgError, TypeError, ValueError) as exc:
                 summary.failed += 1
                 summary.errors.append(
                     {

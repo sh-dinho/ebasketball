@@ -1,4 +1,3 @@
-
 """Run incremental ingestion with a configurable UTC overlap window."""
 
 from __future__ import annotations
@@ -6,13 +5,15 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from ebasketball.ingestion.normalize import normalize_match_time
 from ebasketball.ingestion.pipeline import run_ingestion
 from ebasketball.sources.json_file import JsonFileAdapter
+from ebasketball.sources.live import LiveProviderUnavailable, require_live_provider
 
 
 def _parse_match_date(raw: Mapping[str, Any]) -> date | None:
@@ -38,7 +39,11 @@ def filter_recent_records(
     records: Sequence[Any], *, overlap_days: int, today_utc: date
 ) -> tuple[list[Any], int, date]:
     """Keep records from the UTC cutoff through today, retaining invalid rows."""
-    if not isinstance(overlap_days, int) or isinstance(overlap_days, bool) or overlap_days < 0:
+    if (
+        not isinstance(overlap_days, int)
+        or isinstance(overlap_days, bool)
+        or overlap_days < 0
+    ):
         raise ValueError("overlap_days must be a nonnegative integer")
     cutoff_date = today_utc - timedelta(days=overlap_days)
     filtered: list[Any] = []
@@ -70,7 +75,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Run incremental ingestion with a UTC overlap window "
-            "for late-arriving scores and corrections."
+            "for late-arriving scores and corrections. Live collection is "
+            "disabled until an official provider API is verified."
         )
     )
     parser.add_argument(
@@ -78,7 +84,11 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         choices=("h2hgg", "aceodds"),
     )
-    parser.add_argument("--input", required=True, type=Path)
+    parser.add_argument(
+        "--input",
+        type=Path,
+        help="Offline JSON export. Omit to request live collection (currently disabled).",
+    )
     parser.add_argument(
         "--overlap-days",
         type=int,
@@ -96,6 +106,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--overlap-days must be zero or greater")
 
     try:
+        if args.input is None:
+            require_live_provider(args.source)
         adapter = JsonFileAdapter(args.source, args.input)
         raw_records = adapter.fetch_records()
 
@@ -110,6 +122,12 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=not args.persist,
         )
 
+    except LiveProviderUnavailable as exc:
+        print(
+            json.dumps({"error": f"{type(exc).__name__}: {exc}"}),
+            file=sys.stderr,
+        )
+        return 3
     except (OSError, ValueError, RuntimeError) as exc:
         print(
             json.dumps({"error": f"{type(exc).__name__}: {exc}"}),

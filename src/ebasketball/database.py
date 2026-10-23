@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import Any
 
 import psycopg2
 from psycopg2.extensions import connection as Connection
@@ -48,16 +49,15 @@ def get_connection() -> Iterator[Connection]:
 
 def check_database() -> dict[str, Any]:
     """Return basic connectivity and database identity information."""
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
+    with get_connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            """
                 SELECT
                     current_database() AS database_name,
                     current_user AS database_user,
                     current_timestamp AS checked_at
                 """
-            )
-            row = cursor.fetchone()
+        )
+        row = cursor.fetchone()
 
     return dict(row)

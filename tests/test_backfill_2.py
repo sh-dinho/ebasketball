@@ -130,7 +130,9 @@ def test_adaptive_rejects_invalid_dates_and_does_not_call_provider():
 
 
 def test_empty_or_provider_failed_windows_never_return_success():
-    empty_source = AdaptiveSource(lambda _span, _cursor: backfill.BackfillPage([], None))
+    empty_source = AdaptiveSource(
+        lambda _span, _cursor: backfill.BackfillPage([], None)
+    )
     empty = backfill.run_adaptive_backfill(
         empty_source,
         date(2026, 10, 20),
@@ -162,7 +164,12 @@ def test_empty_or_provider_failed_windows_never_return_success():
 def test_only_out_of_range_records_do_not_count_as_historical_coverage():
     source = AdaptiveSource(
         lambda _span, _cursor: backfill.BackfillPage(
-            [{**completed_fixture("before-window"), "match_time": "2026-07-25T12:00:00Z"}],
+            [
+                {
+                    **completed_fixture("before-window"),
+                    "match_time": "2026-07-25T12:00:00Z",
+                }
+            ],
             None,
         )
     )
@@ -177,6 +184,24 @@ def test_only_out_of_range_records_do_not_count_as_historical_coverage():
     assert summary.completed == 0
     assert not summary.complete
     assert summary.selected_window_days is None
+
+
+def test_summary_reports_requested_and_observed_dates_without_claiming_verification():
+    source = AdaptiveSource(
+        lambda _span, _cursor: backfill.BackfillPage(
+            [completed_fixture("observed")], None
+        )
+    )
+    summary = backfill.run_backfill(
+        source, date(2026, 10, 22), date(2026, 10, 23), dry_run=True
+    )
+
+    assert summary.requested_dates == ["2026-10-22", "2026-10-23"]
+    assert summary.observed_dates == ["2026-10-22"]
+    assert summary.unavailable_dates == ["2026-10-23"]
+    assert summary.pages_fetched == 1
+    assert summary.raw_records == summary.fetched == 1
+    assert summary.coverage_verified is False
 
 
 def test_programming_errors_are_not_mistaken_for_provider_failures():

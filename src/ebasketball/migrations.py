@@ -12,10 +12,12 @@ import argparse
 import hashlib
 import re
 import sys
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Sequence
+
+import psycopg2
 
 from ebasketball import database
 
@@ -23,6 +25,13 @@ DEFAULT_MIGRATION_DIR = Path(__file__).resolve().parents[2] / "sql" / "migration
 _FILENAME = re.compile(r"(?P<version>[0-9]+)_(?P<name>[a-z][a-z0-9_]*)\.sql\Z")
 _LOCK_NAMESPACE = 1162037314
 _LOCK_KEY = 1
+# Exact checksum of the short-lived working-tree 001 variant that removed the
+# legacy observation objects. Migration 003 restores them. Accept this known
+# ledger value without rewriting it so installations that recorded that file
+# can advance safely; all other checksum drift remains an error.
+_COMPATIBLE_LEGACY_CHECKSUMS = {
+    1: frozenset({"1ea74cc77b567d8e773aa9c8e604d65a3624de5762487eb400d55839e3085c1c"}),
+}
 
 
 class MigrationError(RuntimeError):
@@ -154,14 +163,18 @@ def _validate_ledger(
                 f"Applied migration {version} was renamed: ledger has "
                 f"{record['filename']!r}, current file is {migration.filename!r}."
             )
-        if record["checksum"] != migration.checksum:
+        if record["checksum"] != migration.checksum and record[
+            "checksum"
+        ] not in _COMPATIBLE_LEGACY_CHECKSUMS.get(version, frozenset()):
             raise MigrationDriftError(
                 f"Applied migration {version} ({migration.filename}) was modified; "
                 "restore the applied file or add a forward migration."
             )
 
 
-def migration_status(conn, directory: Path = DEFAULT_MIGRATION_DIR) -> list[MigrationStatus]:
+def migration_status(
+    conn, directory: Path = DEFAULT_MIGRATION_DIR
+) -> list[MigrationStatus]:
     """Return migration state using SELECTs only; do not create the ledger."""
     migrations = discover_migrations(directory)
     with conn.cursor() as cursor:
@@ -183,9 +196,7 @@ def migration_status(conn, directory: Path = DEFAULT_MIGRATION_DIR) -> list[Migr
 def _advisory_lock(conn) -> Iterator[None]:
     """Hold a session lock across all migration transactions."""
     with conn.cursor() as cursor:
-        cursor.execute(
-            "SELECT pg_advisory_lock(%s, %s)", (_LOCK_NAMESPACE, _LOCK_KEY)
-        )
+        cursor.execute("SELECT pg_advisory_lock(%s, %s)", (_LOCK_NAMESPACE, _LOCK_KEY))
     conn.commit()
     try:
         yield
@@ -292,12 +303,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     for command in ("status", "apply"):
         subparser = subparsers.add_parser(command)
         subparser.add_argument(
-            "--directory", type=Path, default=DEFAULT_MIGRATION_DIR,
+            "--directory",
+            type=Path,
+            default=DEFAULT_MIGRATION_DIR,
             help="directory containing numbered SQL migrations",
         )
         if command == "apply":
             subparser.add_argument(
-                "--confirm-database", required=True, metavar="NAME",
+                "--confirm-database",
+                required=True,
+                metavar="NAME",
                 help="exact database name to authorize for migration writes",
             )
     args = parser.parse_args(argv)
@@ -315,9 +330,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     except MigrationError as exc:
         print(f"Migration error: {exc}", file=sys.stderr)
         return 1
-    except Exception:
+    except psycopg2.Error:
         # Database driver errors can contain connection details; do not echo them.
         print("Migration command failed due to a database error.", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"Migration configuration error: {exc}", file=sys.stderr)
         return 1
     finally:
         if conn is not None:

@@ -7,14 +7,12 @@ from psycopg2.extensions import connection as Connection
 
 def normalize_handle(handle: str) -> str:
     if not isinstance(handle, str):
-        raise ValueError("Player handle must be a string.")
+        raise TypeError("Player handle must be a string.")
 
     handle = handle.strip()
 
     if not handle or len(handle) > 50:
-        raise ValueError(
-            "Player handle must contain 1–50 characters."
-        )
+        raise ValueError("Player handle must contain 1–50 characters.")
 
     return handle
 

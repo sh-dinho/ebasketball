@@ -17,4 +17,3 @@ class SourceAdapter(Protocol):
 
     def fetch_records(self) -> Iterable[Mapping[str, Any]]:
         """Fetch or load raw source records."""
-

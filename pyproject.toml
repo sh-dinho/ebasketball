@@ -1,4 +1,3 @@
-
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
@@ -6,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ebasketball"
 version = "0.1.0"
-description = "eBasketball data platform"
+description = "Historical eBasketball match data and educational winner analysis"
 requires-python = ">=3.10"
 dependencies = [
     "psycopg2-binary",
     "python-dotenv",
-    "pandas",
+    "pandas"
 ]
 
 [project.optional-dependencies]

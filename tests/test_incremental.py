@@ -8,8 +8,8 @@ from unittest.mock import patch
 
 import pytest
 
-from scripts import run_incremental
 from ebasketball.ingestion.pipeline import IngestionRunSummary
+from scripts import run_incremental
 
 
 def test_timestamp_filter_handles_canonical_and_h2hgg_utc_offsets():
@@ -71,9 +71,12 @@ def test_incremental_cli_defaults_to_preview_and_reports_json(capsys):
             {"startDate": "malformed"},
             {"home_handle": "missing time"},
         ]
-        assert run_incremental.main([
-            "--source", "h2hgg", "--input", "export.json", "--overlap-days", "2"
-        ]) == 0
+        assert (
+            run_incremental.main(
+                ["--source", "h2hgg", "--input", "export.json", "--overlap-days", "2"]
+            )
+            == 0
+        )
     ingest.assert_called_once()
     assert ingest.call_args.kwargs["dry_run"] is True
     assert len(ingest.call_args.args[0][0].fetch_records()) == 3
@@ -89,17 +92,19 @@ def test_h2h_start_date_and_fields_are_accepted_by_ingestion_normalizer(capsys):
         patch.object(run_incremental, "datetime") as datetime_mock,
     ):
         datetime_mock.now.return_value.date.return_value = date(2026, 10, 22)
-        adapter_type.return_value.fetch_records.return_value = [{
-            "externalId": "h2h-1",
-            "startDate": "2026-10-22T18:00:00Z",
-            "participantAName": "Player A",
-            "participantBName": "Player B",
-            "teamAName": "Team A",
-            "teamBName": "Team B",
-            "teamAScore": 70,
-            "teamBScore": 65,
-            "matchStatus": "MATCH_ENDED",
-        }]
+        adapter_type.return_value.fetch_records.return_value = [
+            {
+                "externalId": "h2h-1",
+                "startDate": "2026-10-22T18:00:00Z",
+                "participantAName": "Player A",
+                "participantBName": "Player B",
+                "teamAName": "Team A",
+                "teamBName": "Team B",
+                "teamAScore": 70,
+                "teamBScore": 65,
+                "matchStatus": "MATCH_ENDED",
+            }
+        ]
         assert run_incremental.main(["--source", "h2hgg", "--input", "x.json"]) == 0
     output = json.loads(capsys.readouterr().out)
     assert output["normalized"] == 1
@@ -108,23 +113,28 @@ def test_h2h_start_date_and_fields_are_accepted_by_ingestion_normalizer(capsys):
 
 def test_incremental_cli_rejects_negative_overlap(capsys):
     with pytest.raises(SystemExit) as exc:
-        run_incremental.main([
-            "--source", "h2hgg", "--input", "export.json", "--overlap-days", "-1"
-        ])
+        run_incremental.main(
+            ["--source", "h2hgg", "--input", "export.json", "--overlap-days", "-1"]
+        )
     assert exc.value.code == 2
 
 
 def test_incremental_persistence_requires_explicit_flag(capsys):
     with (
         patch.object(run_incremental, "JsonFileAdapter") as adapter_type,
-        patch.object(run_incremental, "run_ingestion", return_value=IngestionRunSummary()) as ingest,
+        patch.object(
+            run_incremental, "run_ingestion", return_value=IngestionRunSummary()
+        ) as ingest,
         patch.object(run_incremental, "datetime") as datetime_mock,
     ):
         datetime_mock.now.return_value.date.return_value = date(2026, 10, 22)
         adapter_type.return_value.fetch_records.return_value = []
-        assert run_incremental.main([
-            "--source", "h2hgg", "--input", "x.json", "--persist"
-        ]) == 0
+        assert (
+            run_incremental.main(
+                ["--source", "h2hgg", "--input", "x.json", "--persist"]
+            )
+            == 0
+        )
     assert ingest.call_args.kwargs["dry_run"] is False
     assert json.loads(capsys.readouterr().out)["incremental"]["persist_requested"]
 
@@ -132,9 +142,13 @@ def test_incremental_persistence_requires_explicit_flag(capsys):
 def test_incremental_exit_codes_distinguish_validation_and_ingestion_failures(capsys):
     with (
         patch.object(run_incremental, "JsonFileAdapter") as adapter_type,
-        patch.object(run_incremental, "run_ingestion", return_value=IngestionRunSummary(
-            failed=1, errors=[{"stage": "normalize", "error": "bad score"}]
-        )),
+        patch.object(
+            run_incremental,
+            "run_ingestion",
+            return_value=IngestionRunSummary(
+                failed=1, errors=[{"stage": "normalize", "error": "bad score"}]
+            ),
+        ),
         patch.object(run_incremental, "datetime") as datetime_mock,
     ):
         datetime_mock.now.return_value.date.return_value = date(2026, 10, 22)
@@ -144,9 +158,13 @@ def test_incremental_exit_codes_distinguish_validation_and_ingestion_failures(ca
 
     with (
         patch.object(run_incremental, "JsonFileAdapter") as adapter_type,
-        patch.object(run_incremental, "run_ingestion", return_value=IngestionRunSummary(
-            source_failures=[{"source": "h2hgg", "error": "provider failed"}]
-        )),
+        patch.object(
+            run_incremental,
+            "run_ingestion",
+            return_value=IngestionRunSummary(
+                source_failures=[{"source": "h2hgg", "error": "provider failed"}]
+            ),
+        ),
         patch.object(run_incremental, "datetime") as datetime_mock,
     ):
         datetime_mock.now.return_value.date.return_value = date(2026, 10, 22)

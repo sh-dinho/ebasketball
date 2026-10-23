@@ -1,4 +1,3 @@
-
 from datetime import datetime, timezone
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
@@ -7,8 +6,7 @@ from uuid import uuid4
 import pytest
 
 from ebasketball.repositories.matches import upsert_match, validate_fixture
-from ebasketball.repositories.odds import record_fixture_odds
-from ebasketball.repositories.players import get_or_create_player
+from ebasketball.repositories.players import get_or_create_player, normalize_handle
 
 
 @pytest.fixture
@@ -33,157 +31,73 @@ def test_player_handle_validation(conn):
         get_or_create_player(conn, "X" * 51)
 
 
-def test_fixture_and_odds_upsert(conn):
-    suffix = uuid4().hex[:10]
-    home = f"HOME_{suffix}"
-    away = f"AWAY_{suffix}"
+def test_player_handle_rejects_non_string_type():
+    with pytest.raises(TypeError, match="must be a string"):
+        normalize_handle(None)
 
+
+def test_fixture_rejects_non_datetime_type():
     fixture = {
-        "match_time": datetime.now(timezone.utc),
-        "home_handle": home,
-        "away_handle": away,
-        "home_team": home,
-        "away_team": away,
-        "status": "scheduled",
-        "home_moneyline": 1.91,
-        "away_moneyline": 1.95,
-        "spread_line": -2.5,
-        "away_spread_line": 2.5,
-        "home_spread_odds": 1.91,
-        "away_spread_odds": 1.91,
-        "total_line": 105.5,
-        "over_odds": 1.91,
-        "under_odds": 1.91,
+        "match_time": "2026-10-22T12:00:00Z",
+        "home_handle": "PLAYER_A",
+        "away_handle": "PLAYER_B",
     }
+    with pytest.raises(TypeError, match="must be a datetime"):
+        validate_fixture(fixture, "h2hgg")
 
-    first_id = upsert_match(
-        conn, fixture, "h2hgg",
-        source_event_id=f"event-{suffix}",
-        source_url="https://h2hggl.com/en/ebasketball/schedule",
-    )
-    second_id = upsert_match(
-        conn, fixture, "h2hgg",
-        source_event_id=f"event-{suffix}",
-        source_url="https://h2hggl.com/en/ebasketball/schedule",
-    )
 
-    assert first_id == second_id
+def test_source_update_timestamp_is_preserved_with_provenance(conn):
+    suffix = uuid4().hex[:10]
+    updated_at = datetime(2026, 10, 20, 12, tzinfo=timezone.utc)
+    fixture = {
+        "match_time": datetime(2026, 11, 1, tzinfo=timezone.utc),
+        "home_handle": f"SOURCE_HOME_{suffix}",
+        "away_handle": f"SOURCE_AWAY_{suffix}",
+        "status": "scheduled",
+        "source_updated_at": updated_at,
+    }
+    upsert_match(conn, fixture, "h2hgg", source_event_id=f"source-{suffix}")
     with conn.cursor() as cursor:
         cursor.execute(
-            """
-            SELECT COUNT(*) AS provenance_count
-            FROM match_sources
-            WHERE source = %s AND source_event_id = %s
-            """,
-            ("h2hgg", f"event-{suffix}"),
+            "SELECT source_updated_at FROM match_sources WHERE source_event_id = %s",
+            (f"source-{suffix}",),
         )
-        assert cursor.fetchone()["provenance_count"] == 1
-
-    inserted = record_fixture_odds(conn, first_id, fixture, "h2hgg")
-    assert inserted == 6
-
-    unchanged = record_fixture_odds(
-        conn, first_id, fixture, "h2hgg"
-    )
-    assert unchanged == 0
-
-    changed_fixture = {**fixture, "home_moneyline": 2.05}
-    changed = record_fixture_odds(
-        conn, first_id, changed_fixture, "h2hgg"
-    )
-    assert changed == 1
+        assert cursor.fetchone()["source_updated_at"] == updated_at
 
 
-def test_match_outcome_and_source_observation_time_are_preserved(conn):
+def test_newer_source_result_correction_updates_scores_but_stale_import_does_not(conn):
     suffix = uuid4().hex[:10]
-    observed_at = datetime(2026, 10, 22, 18, 29, tzinfo=timezone.utc)
+    event_id = f"correction-{suffix}"
     fixture = {
-        "match_time": datetime(2026, 10, 22, 18, 30, tzinfo=timezone.utc),
-        "home_handle": f"HOME_{suffix}",
-        "away_handle": f"AWAY_{suffix}",
-        "status": "scheduled",
-        "home_moneyline": Decimal("1.95"),
-        "odds_observed_at": observed_at,
+        "match_time": datetime(2026, 10, 20, tzinfo=timezone.utc),
+        "home_handle": f"CORRECTION_HOME_{suffix}",
+        "away_handle": f"CORRECTION_AWAY_{suffix}",
+        "status": "completed",
+        "home_score": 90,
+        "away_score": 80,
+        "source_updated_at": datetime(2026, 10, 20, 1, tzinfo=timezone.utc),
     }
-
-    inserted = upsert_match(
-        conn, fixture, "h2hgg", source_event_id=f"event-{suffix}",
-        return_status=True,
-    )
-    updated = upsert_match(
-        conn, fixture, "h2hgg", source_event_id=f"event-{suffix}",
-        return_status=True,
-    )
-    assert inserted == {"id": inserted["id"], "inserted": True}
-    assert updated == {"id": inserted["id"], "inserted": False}
-
-    assert record_fixture_odds(conn, inserted["id"], fixture, "h2hgg") == 1
-    assert record_fixture_odds(conn, inserted["id"], fixture, "h2hgg") == 0
+    match_id = upsert_match(conn, fixture, "h2hgg", source_event_id=event_id)
+    corrected = {
+        **fixture,
+        "home_score": 70,
+        "away_score": 80,
+        "source_updated_at": datetime(2026, 10, 20, 2, tzinfo=timezone.utc),
+    }
+    upsert_match(conn, corrected, "h2hgg", source_event_id=event_id)
+    stale = {
+        **fixture,
+        "home_score": 99,
+        "away_score": 1,
+        "source_updated_at": datetime(2026, 10, 20, 1, 30, tzinfo=timezone.utc),
+    }
+    upsert_match(conn, stale, "h2hgg", source_event_id=event_id)
     with conn.cursor() as cursor:
         cursor.execute(
-            """
-            SELECT observed_at, source
-            FROM odds_history
-            WHERE match_id = %s AND market_type = 'moneyline'
-              AND outcome = 'home'
-            """,
-            (inserted["id"],),
+            "SELECT home_score, away_score FROM matches WHERE id = %s",
+            (match_id,),
         )
-        row = cursor.fetchone()
-    assert row["observed_at"] == observed_at
-    assert row["source"] == "h2hgg"
-
-
-def test_match_and_odds_persistence_are_source_specific(conn):
-    suffix = uuid4().hex[:10]
-    fixture = {
-        "match_time": datetime.now(timezone.utc),
-        "home_handle": f"HOME_{suffix}",
-        "away_handle": f"AWAY_{suffix}",
-        "status": "scheduled",
-        "home_moneyline": 1.91,
-        "away_moneyline": 2.05,
-    }
-
-    h2h_match_id = upsert_match(
-        conn, fixture, "h2hgg", source_event_id=f"h2h-{suffix}"
-    )
-    ace_match_id = upsert_match(
-        conn, fixture, "aceodds", source_event_id=f"ace-{suffix}"
-    )
-    assert h2h_match_id == ace_match_id
-
-    h2h_inserted = record_fixture_odds(
-        conn, h2h_match_id, fixture, "h2hgg"
-    )
-    ace_fixture = {**fixture, "home_moneyline": 2.1}
-    ace_inserted = record_fixture_odds(
-        conn, ace_match_id, ace_fixture, "aceodds"
-    )
-    assert h2h_inserted == 2
-    assert ace_inserted == 2
-    assert record_fixture_odds(
-        conn, h2h_match_id, fixture, "h2hgg"
-    ) == 0
-    assert record_fixture_odds(
-        conn, ace_match_id, ace_fixture, "aceodds"
-    ) == 0
-
-    with conn.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT source, COUNT(*) AS observation_count
-            FROM odds_history
-            WHERE match_id = %s
-            GROUP BY source
-            """,
-            (h2h_match_id,),
-        )
-        counts = {
-            row["source"]: row["observation_count"]
-            for row in cursor.fetchall()
-        }
-    assert counts == {"h2hgg": 2, "aceodds": 2}
+        assert cursor.fetchone() == {"home_score": 70, "away_score": 80}
 
 
 def test_unkeyed_source_provenance_is_idempotent(conn):
@@ -250,7 +164,7 @@ def test_normalized_completed_fixture_is_saved_with_integer_scores():
     }
     fixture = normalize_fixture(raw, "h2hgg")
     cursor = MagicMock()
-    cursor.fetchone.return_value = {"id": 123}
+    cursor.fetchone.side_effect = [None, {"id": 123}]
     cursor_context = MagicMock()
     cursor_context.__enter__.return_value = cursor
     conn = MagicMock()
@@ -268,7 +182,12 @@ def test_normalized_completed_fixture_is_saved_with_integer_scores():
         )
 
     assert match_id == 123
-    persisted_values = cursor.execute.call_args_list[0].args[1]
+    insert_call = next(
+        call
+        for call in cursor.execute.call_args_list
+        if "INSERT INTO matches" in call.args[0]
+    )
+    persisted_values = insert_call.args[1]
     assert persisted_values["home_score"] == 105
     assert persisted_values["away_score"] == 98
 

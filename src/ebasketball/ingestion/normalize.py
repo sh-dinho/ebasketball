@@ -38,6 +38,12 @@ FIELD_ALIASES = {
         "external_match_key",
         "match_key",
     ),
+    "source_updated_at": (
+        "source_updated_at",
+        "sourceUpdatedAt",
+        "updated_at",
+        "lastUpdated",
+    ),
     "match_time": (
         "match_time",
         "start_time",
@@ -47,11 +53,6 @@ FIELD_ALIASES = {
         "date_time",
         "startTime",
         "startDate",
-    ),
-    "odds_observed_at": (
-        "odds_observed_at",
-        "odds_timestamp",
-        "observed_at",
     ),
     "home_handle": (
         "home_handle",
@@ -78,29 +79,6 @@ FIELD_ALIASES = {
     "status": ("status", "match_status", "event_status", "state", "matchStatus"),
     "home_score": ("home_score", "score_home", "homeScore", "teamAScore"),
     "away_score": ("away_score", "score_away", "awayScore", "teamBScore"),
-    "home_moneyline": (
-        "home_moneyline",
-        "home_ml",
-        "home_odds",
-        "odds_home",
-    ),
-    "away_moneyline": (
-        "away_moneyline",
-        "away_ml",
-        "away_odds",
-        "odds_away",
-    ),
-    "spread_line": ("spread_line", "home_spread", "handicap_home"),
-    "away_spread_line": (
-        "away_spread_line",
-        "away_spread",
-        "handicap_away",
-    ),
-    "home_spread_odds": ("home_spread_odds", "home_handicap_odds"),
-    "away_spread_odds": ("away_spread_odds", "away_handicap_odds"),
-    "total_line": ("total_line", "over_under", "totals_line"),
-    "over_odds": ("over_odds", "odds_over"),
-    "under_odds": ("under_odds", "odds_under"),
     "source_url": ("source_url", "event_url", "url", "link"),
 }
 
@@ -221,15 +199,6 @@ def _decimal(
     return result
 
 
-def _odds(value: Any) -> Decimal | None:
-    """Accept valid decimal odds greater than 1.0."""
-    return _decimal(
-        value,
-        minimum=Decimal("1.0000000001"),
-        maximum=Decimal("9999.999999"),
-    )
-
-
 def _score(value: Any) -> int | None:
     """Parse scores as nonnegative whole numbers without truncation."""
     score = _decimal(value)
@@ -247,15 +216,6 @@ def _score(value: Any) -> int | None:
         return None
 
     return int(score)
-
-
-def _line(value: Any) -> Decimal | None:
-    """Handicap and total lines may be positive or negative."""
-    return _decimal(
-        value,
-        minimum=Decimal(-100000),
-        maximum=Decimal(100000),
-    )
 
 
 def normalize_status(value: Any) -> str:
@@ -420,7 +380,8 @@ def normalize_fixture(
     """Convert a source record into the shared fixture format.
 
     This function is pure: it does not scrape websites, connect to
-    PostgreSQL, or fabricate odds, scores, or event identifiers.
+    PostgreSQL, or fabricate scores or event identifiers. Legacy market
+    fields in source exports are intentionally ignored.
     """
     if not isinstance(raw, Mapping):
         raise TypeError("Fixture record must be a mapping")
@@ -436,8 +397,16 @@ def normalize_fixture(
         raise ValueError(f"Unsupported fixture source: {source!r}")
 
     event_id = _clean_text(_first(raw, FIELD_ALIASES["source_event_id"]))
-    source_match_key = _clean_text(
-        _first(raw, FIELD_ALIASES["source_match_key"])
+    source_match_key = _clean_text(_first(raw, FIELD_ALIASES["source_match_key"]))
+    raw_source_updated_at = _first(raw, FIELD_ALIASES["source_updated_at"])
+    source_updated_at = (
+        normalize_match_time(
+            raw_source_updated_at,
+            source_timezone=source_timezone,
+            board_date=board_date,
+        )
+        if raw_source_updated_at is not None
+        else None
     )
 
     raw_time = _first(raw, FIELD_ALIASES["match_time"])
@@ -449,17 +418,6 @@ def normalize_fixture(
         raw_time,
         source_timezone=source_timezone,
         board_date=board_date,
-    )
-
-    raw_observed_at = _first(raw, FIELD_ALIASES["odds_observed_at"])
-    odds_observed_at = (
-        normalize_match_time(
-            raw_observed_at,
-            source_timezone=source_timezone,
-            board_date=board_date,
-        )
-        if raw_observed_at is not None
-        else None
     )
 
     home_handle = _clean_text(_first(raw, FIELD_ALIASES["home_handle"]))
@@ -488,7 +446,6 @@ def normalize_fixture(
 
     return {
         "match_time": match_time,
-        "odds_observed_at": odds_observed_at,
         "home_handle": home_handle,
         "away_handle": away_handle,
         "home_team": home_team or home_handle,
@@ -496,17 +453,9 @@ def normalize_fixture(
         "status": normalize_status(raw_status),
         "home_score": _score(_first(raw, FIELD_ALIASES["home_score"])),
         "away_score": _score(_first(raw, FIELD_ALIASES["away_score"])),
-        "home_moneyline": _odds(_first(raw, FIELD_ALIASES["home_moneyline"])),
-        "away_moneyline": _odds(_first(raw, FIELD_ALIASES["away_moneyline"])),
-        "spread_line": _line(_first(raw, FIELD_ALIASES["spread_line"])),
-        "away_spread_line": _line(_first(raw, FIELD_ALIASES["away_spread_line"])),
-        "home_spread_odds": _odds(_first(raw, FIELD_ALIASES["home_spread_odds"])),
-        "away_spread_odds": _odds(_first(raw, FIELD_ALIASES["away_spread_odds"])),
-        "total_line": _line(_first(raw, FIELD_ALIASES["total_line"])),
-        "over_odds": _odds(_first(raw, FIELD_ALIASES["over_odds"])),
-        "under_odds": _odds(_first(raw, FIELD_ALIASES["under_odds"])),
         "data_source": source_name,
         "source_event_id": event_id,
         "source_match_key": source_match_key,
+        "source_updated_at": source_updated_at,
         "source_url": resolved_url,
     }

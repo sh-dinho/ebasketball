@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from hashlib import sha256
-import json
 from typing import Any
 
 from psycopg2.extensions import connection as Connection
@@ -12,18 +12,6 @@ from psycopg2.extensions import connection as Connection
 from ebasketball.repositories.players import get_or_create_player
 
 VALID_SOURCES = {"h2hgg", "aceodds", "manual", "synthetic"}
-
-MATCH_FIELDS = (
-    "spread_line",
-    "away_spread_line",
-    "total_line",
-    "home_moneyline",
-    "away_moneyline",
-    "home_spread_odds",
-    "away_spread_odds",
-    "over_odds",
-    "under_odds",
-)
 
 
 def validate_fixture(fixture: dict, source: str) -> None:
@@ -37,7 +25,7 @@ def validate_fixture(fixture: dict, source: str) -> None:
     match_time = fixture["match_time"]
 
     if not isinstance(match_time, datetime):
-        raise ValueError("match_time must be a datetime.")
+        raise TypeError("match_time must be a datetime.")
 
     if match_time.tzinfo is None or match_time.utcoffset() is None:
         raise ValueError("match_time must be timezone-aware.")
@@ -53,25 +41,24 @@ def validate_fixture(fixture: dict, source: str) -> None:
 
     status = fixture.get("status", "scheduled")
     if status not in {
-        "scheduled", "live", "completed",
-        "postponed", "cancelled", "unknown",
+        "scheduled",
+        "live",
+        "completed",
+        "postponed",
+        "cancelled",
+        "unknown",
     }:
         raise ValueError(f"Unsupported match status: {status}")
 
     if status == "completed" and (
-        fixture.get("home_score") is None
-        or fixture.get("away_score") is None
+        fixture.get("home_score") is None or fixture.get("away_score") is None
     ):
-        raise ValueError(
-            "Completed matches must include both scores."
-        )
+        raise ValueError("Completed matches must include both scores.")
 
     for field in ("home_score", "away_score"):
         value = fixture.get(field)
         if value is not None and (
-            isinstance(value, bool)
-            or not isinstance(value, int)
-            or value < 0
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
         ):
             raise ValueError(f"{field} must be a nonnegative integer.")
 
@@ -84,6 +71,7 @@ def _record_source(
     source_url: str | None,
     source_match_key: str | None,
     raw_hash: str | None,
+    source_updated_at: datetime | None,
 ) -> None:
     if source_event_id is not None:
         source_event_id = str(source_event_id).strip() or None
@@ -98,10 +86,11 @@ def _record_source(
                 INSERT INTO match_sources (
                     match_id, source, source_event_id, source_url,
                     source_match_key, raw_hash,
+                    source_updated_at,
                     first_seen_at, last_seen_at, last_checked_at
                 )
                 VALUES (
-                    %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s,
                     CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
                     CURRENT_TIMESTAMP
                 )
@@ -117,6 +106,13 @@ def _record_source(
                         EXCLUDED.source_match_key,
                         match_sources.source_match_key
                     ),
+                    source_updated_at = CASE
+                        WHEN EXCLUDED.source_updated_at IS NOT NULL
+                         AND (match_sources.source_updated_at IS NULL
+                              OR EXCLUDED.source_updated_at > match_sources.source_updated_at)
+                        THEN EXCLUDED.source_updated_at
+                        ELSE match_sources.source_updated_at
+                    END,
                     raw_hash = COALESCE(
                         EXCLUDED.raw_hash,
                         match_sources.raw_hash
@@ -125,8 +121,13 @@ def _record_source(
                     last_checked_at = CURRENT_TIMESTAMP
                 """,
                 (
-                    match_id, source, source_event_id, source_url,
-                    source_match_key, raw_hash,
+                    match_id,
+                    source,
+                    source_event_id,
+                    source_url,
+                    source_match_key,
+                    raw_hash,
+                    source_updated_at,
                 ),
             )
         else:
@@ -136,10 +137,11 @@ def _record_source(
                     INSERT INTO match_sources (
                         match_id, source, source_url,
                         source_match_key, raw_hash,
+                        source_updated_at,
                         first_seen_at, last_seen_at, last_checked_at
                     )
                     VALUES (
-                        %s, %s, %s, NULL, %s,
+                        %s, %s, %s, NULL, %s, %s,
                         CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
                         CURRENT_TIMESTAMP
                     )
@@ -155,10 +157,17 @@ def _record_source(
                             EXCLUDED.raw_hash,
                             match_sources.raw_hash
                         ),
+                        source_updated_at = CASE
+                            WHEN EXCLUDED.source_updated_at IS NOT NULL
+                             AND (match_sources.source_updated_at IS NULL
+                                  OR EXCLUDED.source_updated_at > match_sources.source_updated_at)
+                            THEN EXCLUDED.source_updated_at
+                            ELSE match_sources.source_updated_at
+                        END,
                         last_seen_at = CURRENT_TIMESTAMP,
                         last_checked_at = CURRENT_TIMESTAMP
                     """,
-                    (match_id, source, source_url, raw_hash),
+                    (match_id, source, source_url, raw_hash, source_updated_at),
                 )
             else:
                 cursor.execute(
@@ -166,10 +175,11 @@ def _record_source(
                     INSERT INTO match_sources (
                         match_id, source, source_url,
                         source_match_key, raw_hash,
+                        source_updated_at,
                         first_seen_at, last_seen_at, last_checked_at
                     )
                     VALUES (
-                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s,
                         CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
                         CURRENT_TIMESTAMP
                     )
@@ -183,12 +193,23 @@ def _record_source(
                             EXCLUDED.raw_hash,
                             match_sources.raw_hash
                         ),
+                        source_updated_at = CASE
+                            WHEN EXCLUDED.source_updated_at IS NOT NULL
+                             AND (match_sources.source_updated_at IS NULL
+                                  OR EXCLUDED.source_updated_at > match_sources.source_updated_at)
+                            THEN EXCLUDED.source_updated_at
+                            ELSE match_sources.source_updated_at
+                        END,
                         last_seen_at = CURRENT_TIMESTAMP,
                         last_checked_at = CURRENT_TIMESTAMP
                     """,
                     (
-                        match_id, source, source_url,
-                        source_match_key, raw_hash,
+                        match_id,
+                        source,
+                        source_url,
+                        source_match_key,
+                        raw_hash,
+                        source_updated_at,
                     ),
                 )
 
@@ -202,6 +223,7 @@ def upsert_match(
     source_url: str | None = None,
     source_match_key: str | None = None,
     raw_hash: str | None = None,
+    source_updated_at: datetime | None = None,
     return_status: bool = False,
 ) -> int | dict[str, Any]:
     """
@@ -210,21 +232,21 @@ def upsert_match(
     The caller owns the transaction. This function never commits.
     """
     validate_fixture(fixture, source)
+    fixture = dict(fixture)
+
+    source_updated_at = source_updated_at or fixture.get("source_updated_at")
+    if source_updated_at is not None and (
+        not isinstance(source_updated_at, datetime)
+        or source_updated_at.tzinfo is None
+        or source_updated_at.utcoffset() is None
+    ):
+        raise ValueError("source_updated_at must be a timezone-aware datetime")
 
     home_handle = fixture["home_handle"].strip()
     away_handle = fixture["away_handle"].strip()
 
-    home_id = get_or_create_player(
-        conn, home_handle, fixture.get("home_team")
-    )
-    away_id = get_or_create_player(
-        conn, away_handle, fixture.get("away_team")
-    )
-
-    values = {
-        field: fixture.get(field)
-        for field in MATCH_FIELDS
-    }
+    home_id = get_or_create_player(conn, home_handle, fixture.get("home_team"))
+    away_id = get_or_create_player(conn, away_handle, fixture.get("away_team"))
 
     is_synthetic = source == "synthetic"
 
@@ -237,6 +259,59 @@ def upsert_match(
         )
         raw_hash = sha256(raw.encode("utf-8")).hexdigest()
 
+    allow_score_correction = False
+    previous_source = None
+    if source_event_id:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT ms.source_updated_at, ms.match_id,
+                       m.match_time, m.home_player_id, m.away_player_id,
+                       m.status
+                FROM match_sources AS ms
+                JOIN matches AS m ON m.id = ms.match_id
+                WHERE ms.source = %s AND ms.source_event_id = %s
+                FOR UPDATE OF ms, m
+                """,
+                (source, str(source_event_id).strip()),
+            )
+            previous_source = cursor.fetchone()
+        allow_score_correction = (
+            previous_source is not None
+            and source_updated_at is not None
+            and (
+                previous_source["source_updated_at"] is None
+                or source_updated_at > previous_source["source_updated_at"]
+            )
+        )
+
+    if previous_source is not None:
+        prior_home = previous_source["home_player_id"]
+        prior_away = previous_source["away_player_id"]
+        if (home_id, away_id) == (prior_away, prior_home):
+            for left, right in (
+                ("home_handle", "away_handle"),
+                ("home_team", "away_team"),
+                ("home_score", "away_score"),
+            ):
+                fixture[left], fixture[right] = (fixture.get(right), fixture.get(left))
+            home_id, away_id = prior_home, prior_away
+        elif (home_id, away_id) != (prior_home, prior_away):
+            raise ValueError(
+                "Source event ID is already associated with different participants"
+            )
+
+        existing_time = previous_source["match_time"]
+        if allow_score_correction and previous_source["status"] != "completed":
+            if fixture["match_time"] != existing_time:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE matches SET match_time = %s WHERE id = %s",
+                        (fixture["match_time"], previous_source["match_id"]),
+                    )
+        else:
+            fixture["match_time"] = existing_time
+
     with conn.cursor() as cursor:
         cursor.execute(
             """
@@ -244,20 +319,12 @@ def upsert_match(
                 match_time, home_team, home_player_id,
                 away_team, away_player_id, status,
                 home_score, away_score,
-                spread_line, away_spread_line, total_line,
-                home_moneyline, away_moneyline,
-                home_spread_odds, away_spread_odds,
-                over_odds, under_odds,
                 data_source, is_synthetic
             )
             VALUES (
                 %(match_time)s, %(home_team)s, %(home_id)s,
                 %(away_team)s, %(away_id)s, %(status)s,
                 %(home_score)s, %(away_score)s,
-                %(spread_line)s, %(away_spread_line)s, %(total_line)s,
-                %(home_moneyline)s, %(away_moneyline)s,
-                %(home_spread_odds)s, %(away_spread_odds)s,
-                %(over_odds)s, %(under_odds)s,
                 %(data_source)s, %(is_synthetic)s
             )
             ON CONFLICT (
@@ -277,39 +344,18 @@ def upsert_match(
                         THEN EXCLUDED.status
                     ELSE EXCLUDED.status
                 END,
-                home_score = COALESCE(
-                    EXCLUDED.home_score, matches.home_score
-                ),
-                away_score = COALESCE(
-                    EXCLUDED.away_score, matches.away_score
-                ),
-                spread_line = COALESCE(
-                    EXCLUDED.spread_line, matches.spread_line
-                ),
-                away_spread_line = COALESCE(
-                    EXCLUDED.away_spread_line, matches.away_spread_line
-                ),
-                total_line = COALESCE(
-                    EXCLUDED.total_line, matches.total_line
-                ),
-                home_moneyline = COALESCE(
-                    EXCLUDED.home_moneyline, matches.home_moneyline
-                ),
-                away_moneyline = COALESCE(
-                    EXCLUDED.away_moneyline, matches.away_moneyline
-                ),
-                home_spread_odds = COALESCE(
-                    EXCLUDED.home_spread_odds, matches.home_spread_odds
-                ),
-                away_spread_odds = COALESCE(
-                    EXCLUDED.away_spread_odds, matches.away_spread_odds
-                ),
-                over_odds = COALESCE(
-                    EXCLUDED.over_odds, matches.over_odds
-                ),
-                under_odds = COALESCE(
-                    EXCLUDED.under_odds, matches.under_odds
-                ),
+                home_score = CASE
+                    WHEN matches.home_score IS NULL
+                      OR (%(allow_score_correction)s AND EXCLUDED.status = 'completed')
+                        THEN COALESCE(EXCLUDED.home_score, matches.home_score)
+                    ELSE matches.home_score
+                END,
+                away_score = CASE
+                    WHEN matches.away_score IS NULL
+                      OR (%(allow_score_correction)s AND EXCLUDED.status = 'completed')
+                        THEN COALESCE(EXCLUDED.away_score, matches.away_score)
+                    ELSE matches.away_score
+                END,
                 data_source = CASE
                     WHEN matches.is_synthetic AND NOT EXCLUDED.is_synthetic
                         THEN EXCLUDED.data_source
@@ -321,7 +367,6 @@ def upsert_match(
             RETURNING id, (xmax = 0) AS inserted
             """,
             {
-                **values,
                 "match_time": fixture["match_time"],
                 "home_team": fixture.get("home_team"),
                 "home_id": home_id,
@@ -332,6 +377,7 @@ def upsert_match(
                 "away_score": fixture.get("away_score"),
                 "data_source": source,
                 "is_synthetic": is_synthetic,
+                "allow_score_correction": allow_score_correction,
             },
         )
 
@@ -346,6 +392,7 @@ def upsert_match(
         source_url,
         source_match_key,
         raw_hash,
+        source_updated_at,
     )
 
     if return_status:

@@ -1,4 +1,3 @@
-
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
@@ -40,9 +39,7 @@ def test_normalize_fixture_standardizes_timestamp(raw_fixture):
 
     assert result["match_time"].tzinfo is not None
     assert result["match_time"].utcoffset().total_seconds() == 0
-    assert result["match_time"] == datetime(
-        2026, 10, 23, 0, 30, tzinfo=timezone.utc
-    )
+    assert result["match_time"] == datetime(2026, 10, 23, 0, 30, tzinfo=timezone.utc)
 
 
 def test_normalize_fixture_preserves_source_provenance(raw_fixture):
@@ -55,6 +52,15 @@ def test_normalize_fixture_preserves_source_provenance(raw_fixture):
     assert result["away_handle"] == "PHANTOM"
 
 
+def test_source_update_timestamp_and_market_exclusion_are_preserved(raw_fixture):
+    raw_fixture["sourceUpdatedAt"] = "2026-10-23T08:15:00+02:00"
+    result = normalize_fixture(raw_fixture, "h2hgg")
+    assert result["source_updated_at"] == datetime(
+        2026, 10, 23, 6, 15, tzinfo=timezone.utc
+    )
+    assert not any("odds" in key or "line" in key for key in result)
+
+
 def test_aceodds_adapter_uses_aceodds_source(raw_fixture):
     result = normalize_aceodds_record(raw_fixture)
 
@@ -62,36 +68,11 @@ def test_aceodds_adapter_uses_aceodds_source(raw_fixture):
     assert "aceodds.com" in result["source_url"]
 
 
-def test_normalize_fixture_parses_decimal_values(raw_fixture):
+def test_normalize_fixture_ignores_legacy_market_fields(raw_fixture):
     result = normalize_fixture(raw_fixture, "h2hgg")
 
-    assert result["home_moneyline"] == Decimal("1.91")
-    assert result["away_moneyline"] == Decimal("2.05")
-    assert result["spread_line"] == Decimal("-2.5")
-    assert result["away_spread_line"] == Decimal("2.5")
-    assert result["total_line"] == Decimal("105.5")
-    assert result["over_odds"] == Decimal("1.88")
-
-
-def test_missing_odds_are_none(raw_fixture):
-    raw_fixture["home_moneyline"] = None
-    raw_fixture["away_moneyline"] = ""
-    raw_fixture["over_odds"] = "Suspended"
-
-    result = normalize_fixture(raw_fixture, "h2hgg")
-
-    assert result["home_moneyline"] is None
-    assert result["away_moneyline"] is None
-    assert result["over_odds"] is None
-
-
-@pytest.mark.parametrize("bad_odds", ["1.0", "0", "-1", "NaN", "Infinity"])
-def test_invalid_odds_are_not_accepted(raw_fixture, bad_odds):
-    raw_fixture["home_moneyline"] = bad_odds
-
-    result = normalize_fixture(raw_fixture, "h2hgg")
-
-    assert result["home_moneyline"] is None
+    assert not any("odds" in key or "line" in key for key in result)
+    assert "home_moneyline" not in result
 
 
 def test_missing_scores_remain_none(raw_fixture):
@@ -176,4 +157,6 @@ def test_source_record_url_is_preserved(raw_fixture):
     result = normalize_fixture(raw_fixture, "h2hgg")
 
     assert result["source_url"] == "https://example.com/event/123"
+
+
 """Normalization tests."""

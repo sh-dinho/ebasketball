@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 from ebasketball.ingestion.pipeline import run_ingestion
@@ -34,15 +36,36 @@ def main(argv: list[str] | None = None) -> int:
         metavar="SOURCE=PATH",
         help="JSON array of raw records for h2hgg or aceodds; repeatable",
     )
-    parser.add_argument(
-        "--dry-run",
+    persistence = parser.add_mutually_exclusive_group()
+    persistence.add_argument(
+        "--persist",
         action="store_true",
-        help="collect, normalize, and reconcile without opening a database connection",
+        help="write records to PostgreSQL (preview without database access by default)",
     )
+    persistence.add_argument(
+        "--dry-run",
+        action="store_false",
+        dest="persist",
+        help="explicitly preview without database access; retained for compatibility",
+    )
+    parser.set_defaults(persist=False)
     args = parser.parse_args(argv)
-    summary = run_ingestion(args.input, dry_run=args.dry_run)
+    try:
+        summary = run_ingestion(args.input, dry_run=not args.persist)
+    except (OSError, ValueError) as exc:
+        print(
+            json.dumps({"error": f"{type(exc).__name__}: {exc}"}),
+            file=sys.stderr,
+        )
+        return 2
     print(json.dumps(summary.to_dict(), indent=2, sort_keys=True))
-    return 1 if summary.failed or summary.source_failures else 0
+    if summary.source_failures or any(
+        error.get("stage") in {"reconcile", "persist"}
+        for error in summary.errors
+        if isinstance(error, Mapping)
+    ):
+        return 3
+    return 1 if summary.failed else 0
 
 
 if __name__ == "__main__":

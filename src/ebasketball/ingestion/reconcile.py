@@ -19,8 +19,6 @@ def _normalize_handle(value: Any) -> str:
 
 def _utc_time(value: Any) -> datetime:
     """Validate and normalize a timestamp to UTC."""
-    from datetime import timezone
-
     if not isinstance(value, datetime):
         raise TypeError("match_time must be a datetime")
 
@@ -64,12 +62,13 @@ def fixtures_match(
     """
     Determine whether two source records represent the same fixture.
 
-    Home and away positions must match. Kickoff times may differ by up
-    to tolerance_seconds. This function does not mutate either record.
+    Participant identities may appear in either order. Kickoff times may
+    differ by up to tolerance_seconds. This function does not mutate records;
+    callers choosing a canonical orientation must swap scores with players.
     """
     _validate_tolerance(tolerance_seconds)
 
-    if _fixture_identity(first) != _fixture_identity(second):
+    if set(_fixture_identity(first)) != set(_fixture_identity(second)):
         return False
 
     first_time = _utc_time(first.get("match_time"))

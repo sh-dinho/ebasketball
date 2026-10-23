@@ -2,7 +2,6 @@
 
 from pathlib import Path
 
-
 MIGRATION_DIR = Path(__file__).resolve().parents[1] / "sql" / "migrations"
 
 
@@ -16,8 +15,7 @@ def test_migration_files_are_sequential_and_executable():
     for migration in migrations:
         sql = migration.read_text(encoding="utf-8").strip()
         executable_sql = "\n".join(
-            line for line in sql.splitlines()
-            if not line.lstrip().startswith("--")
+            line for line in sql.splitlines() if not line.lstrip().startswith("--")
         ).strip()
         assert "CREATE TABLE" in executable_sql.upper()
         assert "RERUNNABLE" in sql.upper()

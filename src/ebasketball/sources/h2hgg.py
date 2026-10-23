@@ -1,14 +1,14 @@
 """Primary H2HGG schedule adapter."""
 
+from collections.abc import Mapping
 from datetime import date
-from typing import Any, Mapping
+from typing import Any
 
 from ebasketball.ingestion.normalize import (
     DEFAULT_SOURCE_TIMEZONE,
     SOURCE_URLS,
     normalize_fixture,
 )
-
 
 SCHEDULE_URL = SOURCE_URLS["h2hgg"]
 

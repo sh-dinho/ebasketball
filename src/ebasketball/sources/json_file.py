@@ -20,5 +20,5 @@ class JsonFileAdapter:
         with self.path.open(encoding="utf-8") as input_file:
             records = json.load(input_file)
         if not isinstance(records, list):
-            raise ValueError("JSON source input must contain a top-level array.")
+            raise TypeError("JSON source input must contain a top-level array.")
         return records

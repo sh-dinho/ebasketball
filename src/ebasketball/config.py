@@ -26,9 +26,7 @@ class Settings:
         password = os.getenv("DB_PASSWORD")
 
         if not password:
-            raise ValueError(
-                "DB_PASSWORD is required. Configure it in .env."
-            )
+            raise ValueError("DB_PASSWORD is required. Configure it in .env.")
 
         try:
             port = int(os.getenv("DB_PORT", "5433"))

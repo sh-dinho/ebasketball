@@ -1,4 +1,4 @@
-"""eBasketball analytics."""
+"""Descriptive statistics for completed eBasketball matches."""
 
 from __future__ import annotations
 
@@ -14,18 +14,15 @@ def player_record(
         (matches["status"] == "completed")
         & matches["home_score"].notna()
         & matches["away_score"].notna()
+        & (matches["home_score"] != matches["away_score"])
     ]
-
     home = completed.loc[completed["home_handle"] == player_handle]
     away = completed.loc[completed["away_handle"] == player_handle]
-
     wins = int(
         (home["home_score"] > home["away_score"]).sum()
         + (away["away_score"] > away["home_score"]).sum()
     )
-
     played = len(home) + len(away)
-
     return {
         "played": played,
         "wins": wins,
@@ -44,8 +41,8 @@ def head_to_head(
         (matches["status"] == "completed")
         & matches["home_score"].notna()
         & matches["away_score"].notna()
+        & (matches["home_score"] != matches["away_score"])
     ]
-
     matchups = completed.loc[
         (
             (completed["home_handle"] == player_a)
@@ -56,36 +53,22 @@ def head_to_head(
             & (completed["away_handle"] == player_a)
         )
     ]
-
     home_won = matchups["home_score"] > matchups["away_score"]
     away_won = matchups["away_score"] > matchups["home_score"]
-
     a_wins = int(
         (
             ((matchups["home_handle"] == player_a) & home_won)
             | ((matchups["away_handle"] == player_a) & away_won)
         ).sum()
     )
-
     b_wins = int(
         (
             ((matchups["home_handle"] == player_b) & home_won)
             | ((matchups["away_handle"] == player_b) & away_won)
         ).sum()
     )
-
     return {
         "played": len(matchups),
         "player_a_wins": a_wins,
         "player_b_wins": b_wins,
     }
-
-
-def implied_probability(decimal_odds: float) -> float:
-    """Convert decimal odds into implied probability."""
-    if not 1.0 < decimal_odds < 10000.0:
-        raise ValueError(
-            "Decimal odds must be greater than 1 and less than 10000."
-        )
-
-    return 1.0 / decimal_odds

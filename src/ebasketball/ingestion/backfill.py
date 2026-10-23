@@ -16,7 +16,8 @@ import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -119,10 +120,55 @@ class BackfillSummary:
     dry_run: bool = False
     selected_window_days: int | None = None
     fallback_history: list[dict[str, Any]] = field(default_factory=list)
+    requested_dates: list[str] = field(default_factory=list)
+    observed_dates: list[str] = field(default_factory=list)
+    pages_fetched: int = 0
+    raw_records: int = 0
+    coverage_verified: bool = False
+    invalid_reasons: dict[str, int] = field(default_factory=dict)
+    duplicate_fixture_count: int = 0
+    out_of_range_record_count: int = 0
+    unique_player_handles: list[str] = field(default_factory=list)
+    unique_fixture_keys: list[str] = field(default_factory=list)
+    match_counts_by_day: dict[str, int] = field(default_factory=dict)
+    match_counts_by_source: dict[str, int] = field(default_factory=dict)
+    earliest_observed_completed_date: str | None = None
+    latest_observed_completed_date: str | None = None
+    coverage_status: str = "observed"
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable summary."""
-        return asdict(self)
+        result = asdict(self)
+        result.update(
+            {
+                "requested_start_date": self.start_date,
+                "requested_end_date": self.end_date,
+                "total_input_records": self.fetched,
+                "valid_completed_fixtures": self.completed,
+                "unique_players": len(self.unique_player_handles),
+                "unique_fixtures": len(self.unique_fixture_keys),
+                "missing_calendar_dates": self.unavailable_dates,
+                "source_coverage": {
+                    source: {
+                        "observed_completed_fixtures": count,
+                        "coverage_verified": False,
+                    }
+                    for source, count in self.match_counts_by_source.items()
+                },
+                "freshness_days": (
+                    max(
+                        0,
+                        (
+                            datetime.now(timezone.utc).date()
+                            - date.fromisoformat(self.latest_observed_completed_date)
+                        ).days,
+                    )
+                    if self.latest_observed_completed_date
+                    else None
+                ),
+            }
+        )
+        return result
 
 
 def _date_window(start_date: date, end_date: date) -> list[date]:
@@ -214,7 +260,9 @@ class FileImportSource:
         ):
             records = payload["data"]["games"]
         else:
-            raise BackfillError("JSON import must be an array or contain a games array.")
+            raise BackfillError(
+                "JSON import must be an array or contain a games array."
+            )
         self._records = records
         return records
 
@@ -227,7 +275,11 @@ class FileImportSource:
         cursor: str | None,
     ) -> BackfillPage:
         del start_date, end_date  # UTC filtering uses normalized record timestamps.
-        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_BATCH_SIZE:
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= MAX_BATCH_SIZE
+        ):
             raise ValueError(f"limit must be between 1 and {MAX_BATCH_SIZE}")
         try:
             offset = int(cursor or 0)
@@ -296,12 +348,16 @@ def _load_checkpoint(
     }
     for key, value in expected.items():
         if state.get(key) != value:
-            raise BackfillError(f"Checkpoint {key} does not match this source and date range")
+            raise BackfillError(
+                f"Checkpoint {key} does not match this source and date range"
+            )
     if not isinstance(state.get("summary"), Mapping):
         raise BackfillError("Checkpoint summary is missing or invalid")
     cursor = state.get("next_cursor")
     complete = state.get("complete")
-    if not isinstance(complete, bool) or (cursor is not None and not isinstance(cursor, str)):
+    if not isinstance(complete, bool) or (
+        cursor is not None and not isinstance(cursor, str)
+    ):
         raise BackfillError("Checkpoint pagination state is invalid")
     if complete != (cursor is None):
         raise BackfillError("Checkpoint completion and cursor state disagree")
@@ -319,7 +375,9 @@ def _load_checkpoint(
         except ValueError as exc:
             raise BackfillError("Checkpoint coverage date is invalid") from exc
         if day.isoformat() != day_text or not start_date <= day <= end_date:
-            raise BackfillError("Checkpoint coverage date is outside the requested range")
+            raise BackfillError(
+                "Checkpoint coverage date is outside the requested range"
+            )
     return dict(state)
 
 
@@ -328,8 +386,12 @@ def _save_checkpoint(path: Path, state: Mapping[str, Any]) -> None:
     temporary_name: str | None = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=path.parent,
-            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
         ) as temporary_file:
             temporary_name = temporary_file.name
             json.dump(state, temporary_file, sort_keys=True)
@@ -350,12 +412,15 @@ class _BatchAdapter:
         return self._records
 
 
-def _new_summary(source: HistoricalPageSource, start_date: date, end_date: date, *, dry_run: bool) -> BackfillSummary:
+def _new_summary(
+    source: HistoricalPageSource, start_date: date, end_date: date, *, dry_run: bool
+) -> BackfillSummary:
     return BackfillSummary(
         source=source.name,
         start_date=start_date.isoformat(),
         end_date=end_date.isoformat(),
         dry_run=dry_run,
+        requested_dates=[day.isoformat() for day in _date_window(start_date, end_date)],
     )
 
 
@@ -387,6 +452,11 @@ def _restore_summary(state: Mapping[str, Any], *, dry_run: bool) -> BackfillSumm
     try:
         data = dict(state["summary"])
         data["dry_run"] = dry_run
+        data = {
+            key: value
+            for key, value in data.items()
+            if key in BackfillSummary.__dataclass_fields__
+        }
         return BackfillSummary(**data)
     except (TypeError, KeyError) as exc:
         raise BackfillError("Backfill checkpoint summary is incompatible") from exc
@@ -415,9 +485,17 @@ def run_backfill(
     dates = _date_window(start_date, end_date)
     if source.name not in {"h2hgg", "aceodds"}:
         raise ValueError("source.name must be 'h2hgg' or 'aceodds'")
-    if not isinstance(batch_size, int) or isinstance(batch_size, bool) or not 1 <= batch_size <= MAX_BATCH_SIZE:
+    if (
+        not isinstance(batch_size, int)
+        or isinstance(batch_size, bool)
+        or not 1 <= batch_size <= MAX_BATCH_SIZE
+    ):
         raise ValueError(f"batch_size must be between 1 and {MAX_BATCH_SIZE}")
-    if not isinstance(max_retries, int) or isinstance(max_retries, bool) or max_retries < 0:
+    if (
+        not isinstance(max_retries, int)
+        or isinstance(max_retries, bool)
+        or max_retries < 0
+    ):
         raise ValueError("max_retries must be a nonnegative integer")
     if (
         isinstance(retry_base_delay, bool)
@@ -430,16 +508,23 @@ def run_backfill(
     if not dry_run and checkpoint is None:
         raise ValueError("checkpoint_path is required for a persistent backfill")
 
-    state = None if dry_run else _load_checkpoint(
-        checkpoint, source=source, start_date=start_date, end_date=end_date
+    state = (
+        None
+        if dry_run
+        else _load_checkpoint(
+            checkpoint, source=source, start_date=start_date, end_date=end_date
+        )
     )
-    summary = _restore_summary(state, dry_run=dry_run) if state else _new_summary(
-        source, start_date, end_date, dry_run=dry_run
+    summary = (
+        _restore_summary(state, dry_run=dry_run)
+        if state
+        else _new_summary(source, start_date, end_date, dry_run=dry_run)
     )
     cursor = state.get("next_cursor") if state else None
     if state and state.get("complete"):
         summary.complete = True
         covered_dates = set(state.get("covered_dates", []))
+        summary.observed_dates = sorted(covered_dates)
         summary.unavailable_dates = [
             day.isoformat() for day in dates if day.isoformat() not in covered_dates
         ]
@@ -459,13 +544,21 @@ def run_backfill(
         visited_cursors.add(cursor)
         try:
             page = _retry_fetch(
-                source, start_date, end_date, limit=batch_size, cursor=cursor,
-                max_retries=max_retries, base_delay=retry_base_delay, sleep=sleep,
+                source,
+                start_date,
+                end_date,
+                limit=batch_size,
+                cursor=cursor,
+                max_retries=max_retries,
+                base_delay=retry_base_delay,
+                sleep=sleep,
             )
         except ProviderTruncationError as exc:
             message = _safe_error(exc)
             summary.provider_failures.append(message)
-            summary.errors.append({"stage": "fetch", "error": message, "truncated": True})
+            summary.errors.append(
+                {"stage": "fetch", "error": message, "truncated": True}
+            )
             break
         except (
             ProviderSourceError,
@@ -500,16 +593,24 @@ def run_backfill(
             break
 
         summary.fetched += len(page.records)
+        summary.raw_records += len(page.records)
+        summary.pages_fetched += 1
         persistable: list[Mapping[str, Any]] = []
         page_start_index = summary.fetched - len(page.records)
         for index, raw_record in enumerate(page.records):
             record_index = page_start_index + index
             if not isinstance(raw_record, Mapping):
                 summary.failed += 1
-                summary.errors.append({
-                    "stage": "normalize", "record_index": record_index,
-                    "error": "TypeError: Source record must be a mapping",
-                })
+                summary.invalid_reasons["record_not_object"] = (
+                    summary.invalid_reasons.get("record_not_object", 0) + 1
+                )
+                summary.errors.append(
+                    {
+                        "stage": "normalize",
+                        "record_index": record_index,
+                        "error": "TypeError: Source record must be a mapping",
+                    }
+                )
                 continue
             raw = _map_import_record(source.name, raw_record)
             try:
@@ -518,41 +619,62 @@ def run_backfill(
                     match_date = timestamp.date()
                     if match_date < start_date or match_date > end_date:
                         summary.skipped += 1
-                        summary.errors.append({
-                            "stage": "skip", "reason": "outside requested UTC date range",
-                            "match_date": match_date.isoformat(),
-                        })
+                        summary.out_of_range_record_count += 1
+                        summary.errors.append(
+                            {
+                                "stage": "skip",
+                                "reason": "outside requested UTC date range",
+                                "match_date": match_date.isoformat(),
+                            }
+                        )
                         continue
                     covered_dates.add(match_date.isoformat())
                 fixture = normalize_fixture(raw, source.name)
-            except Exception as exc:
+            except (TypeError, ValueError) as exc:
                 summary.failed += 1
-                summary.errors.append({
-                    "stage": "normalize", "record_index": record_index,
-                    "error": _safe_error(exc),
-                })
+                reason_key = type(exc).__name__
+                summary.invalid_reasons[reason_key] = (
+                    summary.invalid_reasons.get(reason_key, 0) + 1
+                )
+                summary.errors.append(
+                    {
+                        "stage": "normalize",
+                        "record_index": record_index,
+                        "error": _safe_error(exc),
+                    }
+                )
                 continue
             match_date = fixture["match_time"].date()
             if match_date < start_date or match_date > end_date:
                 summary.skipped += 1
-                summary.errors.append({
-                    "stage": "skip", "reason": "outside requested UTC date range",
-                    "match_date": match_date.isoformat(),
-                })
+                summary.out_of_range_record_count += 1
+                summary.errors.append(
+                    {
+                        "stage": "skip",
+                        "reason": "outside requested UTC date range",
+                        "match_date": match_date.isoformat(),
+                    }
+                )
                 continue
             covered_dates.add(match_date.isoformat())
             summary.normalized += 1
             fingerprint = hashlib.sha256(
-                json.dumps(raw_record, sort_keys=True, default=str, separators=(",", ":"))
-                .encode("utf-8")
+                json.dumps(
+                    raw_record, sort_keys=True, default=str, separators=(",", ":")
+                ).encode("utf-8")
             ).hexdigest()
             event_id = fixture.get("source_event_id")
             seen_key = f"{event_id or ''}:{fingerprint}"
             if seen_key in seen_keys:
                 summary.skipped += 1
-                summary.errors.append({
-                    "stage": "skip", "reason": "duplicate event", "event_id": event_id,
-                })
+                summary.duplicate_fixture_count += 1
+                summary.errors.append(
+                    {
+                        "stage": "skip",
+                        "reason": "duplicate event",
+                        "event_id": event_id,
+                    }
+                )
                 continue
             seen_keys.add(seen_key)
             if fixture["status"] != "completed":
@@ -561,25 +683,86 @@ def run_backfill(
                 summary.incomplete_status_counts[status] = (
                     summary.incomplete_status_counts.get(status, 0) + 1
                 )
-                summary.errors.append({
-                    "stage": "incomplete", "status": status, "event_id": event_id,
-                })
+                summary.errors.append(
+                    {
+                        "stage": "incomplete",
+                        "status": status,
+                        "event_id": event_id,
+                    }
+                )
                 continue
             if fixture["home_score"] is None or fixture["away_score"] is None:
                 summary.incomplete_records += 1
                 summary.missing_scores += 1
-                summary.errors.append({
-                    "stage": "incomplete",
-                    "reason": "completed event is missing one or more scores",
-                    "event_id": event_id,
-                })
+                summary.errors.append(
+                    {
+                        "stage": "incomplete",
+                        "reason": "completed event is missing one or more scores",
+                        "event_id": event_id,
+                    }
+                )
                 continue
+            if fixture["home_score"] == fixture["away_score"]:
+                summary.failed += 1
+                summary.invalid_reasons["tied_completed_score"] = (
+                    summary.invalid_reasons.get("tied_completed_score", 0) + 1
+                )
+                summary.errors.append(
+                    {
+                        "stage": "validate",
+                        "reason": "completed basketball fixture has a tied score",
+                        "event_id": event_id,
+                    }
+                )
+                continue
+            home_key = fixture["home_handle"].strip().casefold()
+            away_key = fixture["away_handle"].strip().casefold()
+            ordered_players = sorted((home_key, away_key))
+            fixture_key = (
+                f"{fixture['match_time'].isoformat()}|"
+                f"{ordered_players[0]}|{ordered_players[1]}"
+            )
+            if fixture_key in summary.unique_fixture_keys:
+                summary.duplicate_fixture_count += 1
+                summary.skipped += 1
+                summary.errors.append(
+                    {
+                        "stage": "duplicate",
+                        "fixture_key": fixture_key,
+                        "reason": "duplicate canonical fixture",
+                    }
+                )
+                continue
+            summary.unique_fixture_keys.append(fixture_key)
+            for player in ordered_players:
+                if player not in summary.unique_player_handles:
+                    summary.unique_player_handles.append(player)
+            day_key = match_date.isoformat()
+            summary.match_counts_by_day[day_key] = (
+                summary.match_counts_by_day.get(day_key, 0) + 1
+            )
+            summary.match_counts_by_source[source.name] = (
+                summary.match_counts_by_source.get(source.name, 0) + 1
+            )
+            if summary.earliest_observed_completed_date is None:
+                summary.earliest_observed_completed_date = day_key
+            if summary.latest_observed_completed_date is None:
+                summary.latest_observed_completed_date = day_key
+            else:
+                summary.earliest_observed_completed_date = min(
+                    summary.earliest_observed_completed_date, day_key
+                )
+                summary.latest_observed_completed_date = max(
+                    summary.latest_observed_completed_date, day_key
+                )
             summary.completed += 1
             persistable.append(raw)
 
         page_result = IngestionRunSummary(dry_run=dry_run)
         if persistable:
-            page_result = run_ingestion([_BatchAdapter(source.name, persistable)], dry_run=dry_run)
+            page_result = run_ingestion(
+                [_BatchAdapter(source.name, persistable)], dry_run=dry_run
+            )
             summary.inserted += page_result.inserted
             summary.updated += page_result.updated
             summary.reconciled += page_result.reconciled
@@ -591,42 +774,54 @@ def run_backfill(
         # otherwise one irreparable source record could prevent all later pages.
         if not dry_run and page_succeeded and checkpoint is not None:
             summary.batches_committed += 1
+            summary.observed_dates = sorted(covered_dates)
             if page.next_cursor is None:
                 summary.complete = True
                 summary.unavailable_dates = [
-                    day.isoformat() for day in dates if day.isoformat() not in covered_dates
+                    day.isoformat()
+                    for day in dates
+                    if day.isoformat() not in covered_dates
                 ]
             _save_checkpoint(
                 checkpoint,
                 _checkpoint_state(
-                    source, start_date, end_date, summary,
-                    next_cursor=page.next_cursor, seen_keys=seen_keys,
+                    source,
+                    start_date,
+                    end_date,
+                    summary,
+                    next_cursor=page.next_cursor,
+                    seen_keys=seen_keys,
                     covered_dates=covered_dates,
                 ),
             )
         elif not dry_run:
-            summary.errors.append({
-                "stage": "checkpoint",
-                "error": "Page was not checkpointed because persistence failed",
-            })
+            summary.errors.append(
+                {
+                    "stage": "checkpoint",
+                    "error": "Page was not checkpointed because persistence failed",
+                }
+            )
             break
         elif page.next_cursor is None:
             summary.complete = True
             summary.unavailable_dates = [
                 day.isoformat() for day in dates if day.isoformat() not in covered_dates
             ]
+        summary.observed_dates = sorted(covered_dates)
 
         if progress is not None:
-            progress({
-                "source": source.name,
-                "cursor": page.next_cursor,
-                "fetched": summary.fetched,
-                "normalized": summary.normalized,
-                "completed": summary.completed,
-                "reconciled": summary.reconciled,
-                "batches_committed": summary.batches_committed,
-                "dry_run": dry_run,
-            })
+            progress(
+                {
+                    "source": source.name,
+                    "cursor": page.next_cursor,
+                    "fetched": summary.fetched,
+                    "normalized": summary.normalized,
+                    "completed": summary.completed,
+                    "reconciled": summary.reconciled,
+                    "batches_committed": summary.batches_committed,
+                    "dry_run": dry_run,
+                }
+            )
         if page.next_cursor is None:
             break
         cursor = page.next_cursor
@@ -654,15 +849,30 @@ def run_adaptive_backfill(
     An empty result is not treated as verified coverage.
     """
     _date_window(target_start_date, end_date)
-    if not isinstance(window_sizes, Sequence) or isinstance(window_sizes, (str, bytes)) or not window_sizes:
+    if (
+        not isinstance(window_sizes, Sequence)
+        or isinstance(window_sizes, (str, bytes))
+        or not window_sizes
+    ):
         raise ValueError("window_sizes must be a nonempty sequence")
-    if any(not isinstance(days, int) or isinstance(days, bool) or days <= 0 for days in window_sizes):
+    if any(
+        not isinstance(days, int) or isinstance(days, bool) or days <= 0
+        for days in window_sizes
+    ):
         raise ValueError("window_sizes must contain positive integers")
-    if any(left <= right for left, right in zip(window_sizes, window_sizes[1:])):
+    if any(left <= right for left, right in pairwise(window_sizes)):
         raise ValueError("window_sizes must be strictly decreasing")
-    if not isinstance(batch_size, int) or isinstance(batch_size, bool) or not 1 <= batch_size <= MAX_BATCH_SIZE:
+    if (
+        not isinstance(batch_size, int)
+        or isinstance(batch_size, bool)
+        or not 1 <= batch_size <= MAX_BATCH_SIZE
+    ):
         raise ValueError(f"batch_size must be between 1 and {MAX_BATCH_SIZE}")
-    if not isinstance(max_retries, int) or isinstance(max_retries, bool) or max_retries < 0:
+    if (
+        not isinstance(max_retries, int)
+        or isinstance(max_retries, bool)
+        or max_retries < 0
+    ):
         raise ValueError("max_retries must be a nonnegative integer")
     if (
         isinstance(retry_base_delay, bool)
@@ -682,10 +892,16 @@ def run_adaptive_backfill(
             checkpoint_path = base.with_name(f"{base.stem}_{days}d{base.suffix}")
         try:
             summary = run_backfill(
-                source, current_start, end_date, batch_size=batch_size,
-                dry_run=dry_run, checkpoint_path=checkpoint_path,
-                max_retries=max_retries, retry_base_delay=retry_base_delay,
-                sleep=sleep, progress=progress,
+                source,
+                current_start,
+                end_date,
+                batch_size=batch_size,
+                dry_run=dry_run,
+                checkpoint_path=checkpoint_path,
+                max_retries=max_retries,
+                retry_base_delay=retry_base_delay,
+                sleep=sleep,
+                progress=progress,
             )
         except ProviderSourceError as exc:
             failures.append({"window_days": days, "reason": _safe_error(exc)})
@@ -708,26 +924,30 @@ def run_adaptive_backfill(
             continue
         summary.selected_window_days = days
         summary.fallback_history = list(failures)
-        summary.errors.append({
-            "stage": "adaptive_window",
-            "selected_window_days": days,
-            "fallback_history": list(failures),
-        })
+        summary.errors.append(
+            {
+                "stage": "adaptive_window",
+                "selected_window_days": days,
+                "fallback_history": list(failures),
+            }
+        )
         return summary
 
     if last_summary is None:
-        last_summary = _new_summary(source, target_start_date, end_date, dry_run=dry_run)
-        last_summary.provider_failures.extend(
-            str(item["reason"]) for item in failures
+        last_summary = _new_summary(
+            source, target_start_date, end_date, dry_run=dry_run
         )
+        last_summary.provider_failures.extend(str(item["reason"]) for item in failures)
     last_summary.complete = False
     last_summary.selected_window_days = None
     last_summary.fallback_history = list(failures)
     # Do not erase provider failures from the final attempt. If the last
     # attempt was an empty response, explicitly report why no window succeeded.
-    last_summary.errors.append({
-        "stage": "adaptive_window",
-        "fallback_history": list(failures),
-        "reason": "No configured window established a complete, nonempty result",
-    })
+    last_summary.errors.append(
+        {
+            "stage": "adaptive_window",
+            "fallback_history": list(failures),
+            "reason": "No configured window established a complete, nonempty result",
+        }
+    )
     return last_summary

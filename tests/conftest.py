@@ -73,9 +73,7 @@ def migrated_connection():
 
     try:
         with conn.cursor() as cursor:
-            cursor.execute(
-                "SELECT current_database() AS database_name"
-            )
+            cursor.execute("SELECT current_database() AS database_name")
             database_name = cursor.fetchone()["database_name"]
             if not database_name.endswith("_test"):
                 pytest.fail(
@@ -92,12 +90,10 @@ def migrated_connection():
 
             migration_files = sorted(MIGRATION_DIR.glob("[0-9][0-9][0-9]_*.sql"))
             expected_prefixes = [
-                f"{number:03d}"
-                for number in range(1, len(migration_files) + 1)
+                f"{number:03d}" for number in range(1, len(migration_files) + 1)
             ]
             actual_prefixes = [
-                path.name.split("_", maxsplit=1)[0]
-                for path in migration_files
+                path.name.split("_", maxsplit=1)[0] for path in migration_files
             ]
             if actual_prefixes != expected_prefixes:
                 pytest.fail("Migration files must be sequentially numbered from 001.")
