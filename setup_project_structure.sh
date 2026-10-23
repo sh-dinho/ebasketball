@@ -117,7 +117,7 @@ create_if_missing ".gitignore" \
     '# Secrets
 .env
 .env.*
-!.env.example
+!.env
 
 # Python
 .venv/
