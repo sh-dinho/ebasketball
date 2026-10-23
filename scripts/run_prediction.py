@@ -18,6 +18,7 @@ from ebasketball.ingestion.normalize import normalize_fixture
 from ebasketball.prediction import METHOD_VERSION, backtest, predict_winner
 from ebasketball.repositories.predictions import (
     create_prediction,
+    list_prediction_evaluation_history,
     list_predictions,
     prediction_performance,
     reconcile_predictions,
@@ -94,22 +95,45 @@ def main(argv: list[str] | None = None) -> int:
         "--metrics", action="store_true", help="Summarize prediction performance"
     )
     parser.add_argument(
+        "--evaluation-history",
+        action="store_true",
+        help="List append-only prediction evaluation and retraction events",
+    )
+    parser.add_argument(
+        "--prediction-record-id",
+        type=int,
+        help="Limit --evaluation-history to one prediction record",
+    )
+    parser.add_argument(
         "--start-date", type=lambda value: datetime.fromisoformat(value).date()
     )
     parser.add_argument(
         "--end-date", type=lambda value: datetime.fromisoformat(value).date()
     )
     parser.add_argument(
-        "--match-id-filter", type=int, help="Limit reconciliation to one fixture"
+        "--match-id-filter",
+        type=int,
+        help="Limit reconciliation or evaluation-history output to one fixture",
     )
     parser.add_argument(
         "--export", type=Path, help="Write database output as JSON or CSV"
     )
     args = parser.parse_args(argv)
 
-    actions = [args.list_all, args.pending, args.reconcile, args.metrics]
+    actions = [
+        args.list_all,
+        args.pending,
+        args.reconcile,
+        args.metrics,
+        args.evaluation_history,
+    ]
     if sum(actions) > 1:
-        parser.error("choose only one of --list, --pending, --reconcile, or --metrics")
+        parser.error(
+            "choose only one of --list, --pending, --reconcile, --metrics, "
+            "or --evaluation-history"
+        )
+    if args.prediction_record_id is not None and not args.evaluation_history:
+        parser.error("--prediction-record-id requires --evaluation-history")
     if args.persist and not (args.reconcile or args.input):
         parser.error("--persist requires prediction input or --reconcile")
     if args.reconcile and not args.persist:
@@ -120,12 +144,24 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--start-date must be on or before --end-date")
 
     try:
-        if args.list_all or args.pending or args.reconcile or args.metrics:
+        if (
+            args.list_all
+            or args.pending
+            or args.reconcile
+            or args.metrics
+            or args.evaluation_history
+        ):
             with get_connection() as conn:
                 if args.list_all or args.pending:
                     result = list_predictions(conn, pending_only=args.pending)
                 elif args.reconcile:
                     result = reconcile_predictions(conn, match_id=args.match_id_filter)
+                elif args.evaluation_history:
+                    result = list_prediction_evaluation_history(
+                        conn,
+                        prediction_id=args.prediction_record_id,
+                        match_id=args.match_id_filter,
+                    )
                 else:
                     result = prediction_performance(
                         conn, start_date=args.start_date, end_date=args.end_date

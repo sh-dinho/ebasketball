@@ -1,11 +1,15 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
 
-from ebasketball.repositories.matches import upsert_match, validate_fixture
+from ebasketball.repositories.matches import (
+    AmbiguousFixtureMatchError,
+    upsert_match,
+    validate_fixture,
+)
 from ebasketball.repositories.players import get_or_create_player, normalize_handle
 
 
@@ -127,6 +131,124 @@ def test_unkeyed_source_provenance_is_idempotent(conn):
             (match_id, "h2hgg"),
         )
         assert cursor.fetchone()["provenance_count"] == 1
+
+
+def test_cross_run_reversed_fixture_with_nearby_time_preserves_provenance(conn):
+    suffix = uuid4().hex[:10]
+    start = datetime(2026, 10, 20, 18, tzinfo=timezone.utc)
+    first = {
+        "match_time": start,
+        "home_handle": f"CROSS_HOME_{suffix}",
+        "away_handle": f"CROSS_AWAY_{suffix}",
+        "status": "scheduled",
+    }
+    match_id = upsert_match(conn, first, "h2hgg", source_event_id=f"h-{suffix}")
+    second = {
+        "match_time": start + timedelta(seconds=90),
+        "home_handle": first["away_handle"],
+        "away_handle": first["home_handle"],
+        "status": "completed",
+        "home_score": 81,
+        "away_score": 90,
+    }
+    second_id = upsert_match(
+        conn,
+        second,
+        "aceodds",
+        source_event_id=f"a-{suffix}",
+        source_url="https://example.invalid/event",
+    )
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT COUNT(*) AS count FROM matches WHERE id = %s", (match_id,)
+        )
+        assert cursor.fetchone()["count"] == 1
+        assert second_id == match_id
+        cursor.execute(
+            "SELECT home_score, away_score, status FROM matches WHERE id = %s",
+            (match_id,),
+        )
+        assert cursor.fetchone() == {
+            "home_score": 90,
+            "away_score": 81,
+            "status": "completed",
+        }
+        cursor.execute(
+            "SELECT source, source_event_id FROM match_sources WHERE match_id = %s",
+            (match_id,),
+        )
+        assert {
+            (row["source"], row["source_event_id"]) for row in cursor.fetchall()
+        } == {
+            ("h2hgg", f"h-{suffix}"),
+            ("aceodds", f"a-{suffix}"),
+        }
+
+
+def test_cross_run_ambiguous_candidates_are_not_merged(conn):
+    suffix = uuid4().hex[:10]
+    start = datetime(2026, 10, 20, 18, tzinfo=timezone.utc)
+    home, away = f"AMB_HOME_{suffix}", f"AMB_AWAY_{suffix}"
+    ids = []
+    for offset, event_id in ((0, "first"), (8, "second")):
+        ids.append(
+            upsert_match(
+                conn,
+                {
+                    "match_time": start.replace(minute=offset),
+                    "home_handle": home,
+                    "away_handle": away,
+                    "status": "scheduled",
+                },
+                "h2hgg",
+                source_event_id=f"{event_id}-{suffix}",
+            )
+        )
+
+    with pytest.raises(AmbiguousFixtureMatchError, match="multiple stored candidates"):
+        upsert_match(
+            conn,
+            {
+                "match_time": start.replace(minute=4),
+                "home_handle": away,
+                "away_handle": home,
+                "status": "scheduled",
+            },
+            "aceodds",
+            source_event_id=f"ambiguous-{suffix}",
+        )
+
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT COUNT(*) AS count FROM matches WHERE id = ANY(%s)", (ids,)
+        )
+        assert cursor.fetchone()["count"] == 2
+        cursor.execute(
+            "SELECT COUNT(*) AS count FROM match_sources WHERE source_event_id = %s",
+            (f"ambiguous-{suffix}",),
+        )
+        assert cursor.fetchone()["count"] == 0
+
+
+def test_same_source_new_event_id_is_not_fuzzy_merged_without_cross_source_evidence(
+    conn,
+):
+    suffix = uuid4().hex[:10]
+    start = datetime(2026, 10, 20, 18, tzinfo=timezone.utc)
+    base = {
+        "match_time": start,
+        "home_handle": f"SAME_SOURCE_HOME_{suffix}",
+        "away_handle": f"SAME_SOURCE_AWAY_{suffix}",
+        "status": "scheduled",
+    }
+    original = upsert_match(conn, base, "h2hgg", source_event_id=f"original-{suffix}")
+    possible_repeat = upsert_match(
+        conn,
+        {**base, "match_time": start + timedelta(minutes=3)},
+        "h2hgg",
+        source_event_id=f"new-id-{suffix}",
+    )
+    assert possible_repeat != original
 
 
 def test_fixture_rejects_naive_datetime(conn):

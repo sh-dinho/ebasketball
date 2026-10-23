@@ -263,7 +263,10 @@ participants and start time must agree with the requested fixture. The default
 run ID is stable for the fixture and method version, making a repeated
 prediction idempotent. Supply a new `--run-id` UUID to intentionally record a
 second snapshot. Snapshots are immutable; result evaluations are appended when
-results arrive or scores change.
+results arrive or scores change. If a completed fixture is retracted to
+scheduled or live, the current prediction returns to pending and a retraction
+event is appended; previous evaluation events remain available for audit but
+are excluded from current performance metrics.
 
 ```sh
 # Preview without database access
@@ -279,6 +282,8 @@ results arrive or scores change.
 .venv/bin/python scripts/run_prediction.py --list
 .venv/bin/python scripts/run_prediction.py --pending
 .venv/bin/python scripts/run_prediction.py --metrics --start-date 2026-01-01
+.venv/bin/python scripts/run_prediction.py --evaluation-history
+.venv/bin/python scripts/run_prediction.py --evaluation-history --prediction-record-id 123
 .venv/bin/python scripts/run_prediction.py --reconcile --persist
 ```
 
@@ -311,6 +316,10 @@ analysis and chronological backtesting do not.
 Offline JSON/CSV preview, incremental filtering, prediction, and backtesting
 need no database configuration. Database persistence and migration commands
 load the following settings from the environment or a local `.env` file:
+
+For local configuration, copy `.env.example` to `.env` and fill in the local
+database password. The example uses a development database name; it does not
+contain credentials.
 
 | Variable | Required | Default |
 | --- | --- | --- |

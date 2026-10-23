@@ -296,11 +296,12 @@ def reconcile_predictions(
                m.status AS match_status, m.home_score, m.away_score,
                m.home_player_id, m.away_player_id, m.is_synthetic,
                m.updated_at AS result_available_at,
-               previous.result_signature AS previous_signature
+               previous.result_signature AS previous_signature,
+               previous.result_fingerprint AS previous_fingerprint
         FROM prediction_records AS p
         JOIN matches AS m ON m.id = p.match_id
         LEFT JOIN LATERAL (
-            SELECT result_signature
+            SELECT result_signature, result_fingerprint
             FROM prediction_evaluation_events
             WHERE prediction_id = p.id
             ORDER BY id DESC LIMIT 1
@@ -326,16 +327,23 @@ def reconcile_predictions(
             predicted_winner_player_id=row["predicted_winner_player_id"],
             is_synthetic=row["is_synthetic"],
         )
-        if classification is None:
-            counts["pending"] += 1
-            continue
-        status, classified_winner_id = classification
-
         signature = _fingerprint(row)
         if row["previous_signature"] == signature:
-            counts["unchanged"] += 1
+            counts["pending" if classification is None else "unchanged"] += 1
             continue
-        previous_version = row["current_result_fingerprint"] or ""
+
+        # A scheduled/live update retracts the current result while preserving
+        # the prior evaluation as an append-only audit event. The current
+        # prediction becomes pending until another trustworthy result arrives.
+        if classification is None:
+            if row["previous_signature"] is None:
+                counts["pending"] += 1
+                continue
+            status, classified_winner_id = "unable_to_evaluate", None
+        else:
+            status, classified_winner_id = classification
+
+        previous_version = row["previous_fingerprint"] or ""
         version = hashlib.sha256(f"{previous_version}:{signature}".encode()).hexdigest()
         with conn.cursor() as cursor:
             cursor.execute(
@@ -353,8 +361,8 @@ def reconcile_predictions(
                     signature,
                     status,
                     row["match_status"],
-                    row["home_score"],
-                    row["away_score"],
+                    row["home_score"] if classification is not None else None,
+                    row["away_score"] if classification is not None else None,
                     classified_winner_id,
                     row["result_available_at"],
                 ),
@@ -364,19 +372,31 @@ def reconcile_predictions(
                 cursor.execute(
                     """
                     UPDATE prediction_records
-                    SET status = %s, evaluated_at = CURRENT_TIMESTAMP,
-                        current_result_fingerprint = %s
+                    SET status = %s,
+                        evaluated_at = CASE WHEN %s THEN NULL ELSE CURRENT_TIMESTAMP END,
+                        current_result_fingerprint = CASE WHEN %s THEN NULL ELSE %s END
                     WHERE id = %s
-                    """,
-                    (status, version, row["prediction_id"]),
+                """,
+                    (
+                        "pending" if classification is None else status,
+                        classification is None,
+                        classification is None,
+                        version,
+                        row["prediction_id"],
+                    ),
                 )
-        counts[status if inserted else "unchanged"] += 1
+        if classification is None:
+            counts["retracted" if inserted else "unchanged"] += 1
+            counts["pending"] += 1
+        else:
+            counts[status if inserted else "unchanged"] += 1
     return {
         "evaluated": counts["correct"] + counts["incorrect"],
         "correct": counts["correct"],
         "incorrect": counts["incorrect"],
         "void": counts["void"],
         "unable_to_evaluate": counts["unable_to_evaluate"],
+        "retracted": counts["retracted"],
         "pending": counts["pending"],
         "unchanged": counts["unchanged"],
     }
@@ -404,6 +424,44 @@ def list_predictions(
             WHERE TRUE {status_filter}
             ORDER BY p.prediction_created_at DESC, p.id DESC
             """
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def list_prediction_evaluation_history(
+    conn: Connection,
+    *,
+    prediction_id: int | None = None,
+    match_id: int | None = None,
+) -> list[dict[str, Any]]:
+    """List append-only evaluation and retraction events for predictions."""
+    if prediction_id is not None and match_id is not None:
+        raise ValueError("Specify prediction_id or match_id, not both")
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT e.id AS evaluation_event_id, e.prediction_id, p.match_id,
+                   p.prediction_run_id, p.prediction_created_at,
+                   p.method_version, hp.handle AS home_player,
+                   ap.handle AS away_player, wp.handle AS predicted_winner,
+                   e.status AS event_status, e.result_status,
+                   e.home_score, e.away_score,
+                   awp.handle AS actual_winner,
+                   e.result_available_at, e.evaluated_at,
+                   e.result_fingerprint, e.result_signature,
+                   (e.result_fingerprint = p.current_result_fingerprint)
+                       AS is_current
+            FROM prediction_evaluation_events AS e
+            JOIN prediction_records AS p ON p.id = e.prediction_id
+            JOIN players AS hp ON hp.id = p.home_player_id
+            JOIN players AS ap ON ap.id = p.away_player_id
+            LEFT JOIN players AS wp ON wp.id = p.predicted_winner_player_id
+            LEFT JOIN players AS awp ON awp.id = e.actual_winner_player_id
+            WHERE (%s IS NULL OR e.prediction_id = %s)
+              AND (%s IS NULL OR p.match_id = %s)
+            ORDER BY p.id, e.id
+            """,
+            (prediction_id, prediction_id, match_id, match_id),
         )
         return [dict(row) for row in cursor.fetchall()]
 

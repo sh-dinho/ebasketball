@@ -15,7 +15,7 @@ from psycopg2 import Error as PsycopgError
 from ebasketball.database import get_connection
 from ebasketball.ingestion.normalize import normalize_fixture
 from ebasketball.ingestion.reconcile import reconcile_fixtures
-from ebasketball.repositories.matches import upsert_match
+from ebasketball.repositories.matches import AmbiguousFixtureMatchError, upsert_match
 from ebasketball.sources.interface import SourceAdapter
 from ebasketball.sources.live import LiveProviderUnavailable
 
@@ -301,6 +301,16 @@ def run_ingestion(
                 )
                 summary.inserted += int(outcome["inserted"])
                 summary.updated += int(outcome["updated"])
+            except AmbiguousFixtureMatchError as exc:
+                summary.skipped += 1
+                summary.errors.append(
+                    {
+                        "source": record["source"],
+                        "record_index": record["record_index"],
+                        "stage": "identity",
+                        "error": _safe_error(exc),
+                    }
+                )
             except (PsycopgError, TypeError, ValueError) as exc:
                 summary.failed += 1
                 summary.errors.append(

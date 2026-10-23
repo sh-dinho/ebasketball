@@ -77,21 +77,6 @@ CREATE TABLE IF NOT EXISTS matches (
             )
         ),
 
-    -- A completed fixture must have a decisive winner.
-    CONSTRAINT ck_completed_matches_decisive
-        CHECK (
-            status <> 'completed'
-            OR home_score <> away_score
-        ),
-
-    -- The source must be marked synthetic consistently.
-    CONSTRAINT ck_matches_synthetic_source
-        CHECK (
-            (data_source = 'synthetic' AND is_synthetic)
-            OR
-            (data_source <> 'synthetic' AND NOT is_synthetic)
-        ),
-
     CONSTRAINT uq_matches_fixture
         UNIQUE (match_time, home_player_id, away_player_id)
 );
@@ -201,12 +186,54 @@ CREATE TABLE IF NOT EXISTS odds_history (
     CONSTRAINT ck_odds_market_outcome CHECK (
         (market_type IN ('moneyline', 'spread') AND outcome IN ('home', 'away'))
         OR (market_type = 'total' AND outcome IN ('over', 'under'))
-    ),
-    CONSTRAINT ck_odds_synthetic_source CHECK (
-        (source = 'synthetic' AND is_synthetic)
-        OR (source <> 'synthetic' AND NOT is_synthetic)
     )
 );
+
+-- Match the migration sequence: preserve legacy rows while enforcing these
+-- checks on new and updated rows. A bootstrap database starts empty, but
+-- keeping the validation state consistent simplifies schema comparison.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'matches'::regclass
+          AND conname = 'ck_completed_matches_decisive'
+    ) THEN
+        ALTER TABLE matches
+            ADD CONSTRAINT ck_completed_matches_decisive
+            CHECK (status <> 'completed' OR home_score <> away_score)
+            NOT VALID;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'matches'::regclass
+          AND conname = 'ck_matches_synthetic_source'
+    ) THEN
+        ALTER TABLE matches
+            ADD CONSTRAINT ck_matches_synthetic_source
+            CHECK (
+                (data_source = 'synthetic' AND is_synthetic)
+                OR (data_source <> 'synthetic' AND NOT is_synthetic)
+            )
+            NOT VALID;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'odds_history'::regclass
+          AND conname = 'ck_odds_synthetic_source'
+    ) THEN
+        ALTER TABLE odds_history
+            ADD CONSTRAINT ck_odds_synthetic_source
+            CHECK (
+                (source = 'synthetic' AND is_synthetic)
+                OR (source <> 'synthetic' AND NOT is_synthetic)
+            )
+            NOT VALID;
+    END IF;
+END;
+$$;
 
 -- =========================================================
 -- Match query indexes

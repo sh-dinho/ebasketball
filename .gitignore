@@ -22,7 +22,10 @@ PyInstaller
 Python environments and package managers
 ============================================================
 
-.env .env.* !.env.example .envrc
+.env
+.env.*
+!.env.example
+.envrc
 
 .venv/ venv/ env/ ENV/ env.bak/ venv.bak/
 

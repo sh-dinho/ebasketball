@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from ebasketball.repositories.predictions import (
     create_prediction,
+    list_prediction_evaluation_history,
     list_predictions,
     prediction_performance,
     reconcile_predictions,
@@ -292,6 +293,150 @@ def test_schema_sql_fresh_install_has_compatibility_objects(empty_test_connectio
         assert cursor.fetchone()["table_name"] == "prediction_evaluation_events"
 
 
+def test_schema_sql_matches_fresh_migration_object_definitions(migrated_connection):
+    """Compare catalog objects from migrations with the bootstrap SQL."""
+    from psycopg2 import sql
+
+    schema = Path(__file__).resolve().parents[1] / "sql" / "schema.sql"
+    conn = migrated_connection
+    bootstrap_schema = f"schema_parity_{uuid4().hex}"
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT current_schema() AS schema_name")
+        migration_schema = cursor.fetchone()["schema_name"]
+        cursor.execute(
+            sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(bootstrap_schema))
+        )
+        cursor.execute(
+            sql.SQL("SET search_path TO {}").format(sql.Identifier(bootstrap_schema))
+        )
+        cursor.execute(schema.read_text(encoding="utf-8"))
+
+    def catalog_signature(schema_name: str) -> dict[str, set[tuple]]:
+        def stable_rows(rows):
+            return {
+                tuple(
+                    value.replace(schema_name, "<schema>").replace(" NOT VALID", "")
+                    if isinstance(value, str)
+                    else value
+                    for value in row.values()
+                )
+                for row in rows
+            }
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT table_name, column_name, ordinal_position, data_type,
+                       is_nullable, column_default, is_identity, identity_generation
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                ORDER BY table_name, ordinal_position
+                """
+            )
+            columns = stable_rows(cursor.fetchall())
+            cursor.execute(
+                """
+                SELECT t.table_name, c.constraint_name, c.constraint_type,
+                       pg_get_constraintdef(pc.oid)
+                FROM information_schema.table_constraints AS c
+                JOIN information_schema.tables AS t
+                  ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+                JOIN pg_namespace AS n ON n.nspname = c.table_schema
+                JOIN pg_class AS r ON r.relnamespace = n.oid AND r.relname = t.table_name
+                JOIN pg_constraint AS pc ON pc.conrelid = r.oid
+                                         AND pc.conname = c.constraint_name
+                WHERE c.table_schema = current_schema()
+                ORDER BY t.table_name, c.constraint_name
+                """
+            )
+            constraints = stable_rows(cursor.fetchall())
+            cursor.execute(
+                """
+                SELECT tablename, indexname, indexdef
+                FROM pg_indexes WHERE schemaname = current_schema()
+                ORDER BY tablename, indexname
+                """
+            )
+            indexes = stable_rows(cursor.fetchall())
+            cursor.execute(
+                """
+                SELECT table_name, view_definition
+                FROM information_schema.views WHERE table_schema = current_schema()
+                ORDER BY table_name
+                """
+            )
+            views = stable_rows(cursor.fetchall())
+            cursor.execute(
+                """
+                SELECT event_object_table, trigger_name, action_timing,
+                       event_manipulation, action_statement
+                FROM information_schema.triggers
+                WHERE trigger_schema = current_schema()
+                ORDER BY event_object_table, trigger_name, event_manipulation
+                """
+            )
+            triggers = stable_rows(cursor.fetchall())
+        return {
+            "columns": columns,
+            "constraints": constraints,
+            "indexes": indexes,
+            "views": views,
+            "triggers": triggers,
+        }
+
+    bootstrap_signature = catalog_signature(bootstrap_schema)
+    with conn.cursor() as cursor:
+        cursor.execute(
+            sql.SQL("SET search_path TO {}").format(sql.Identifier(migration_schema))
+        )
+    migration_signature = catalog_signature(migration_schema)
+
+    # Migration 003 deliberately leaves three checks NOT VALID so upgrades can
+    # preserve legacy rows. The bootstrap SQL now mirrors that catalog state;
+    # all three constraints still enforce new and updated rows.
+    for object_type in bootstrap_signature:
+        assert bootstrap_signature[object_type] == migration_signature[object_type], (
+            object_type,
+            bootstrap_signature[object_type] - migration_signature[object_type],
+            migration_signature[object_type] - bootstrap_signature[object_type],
+        )
+    with conn.cursor() as cursor:
+        cursor.execute(
+            sql.SQL("SET search_path TO {}").format(sql.Identifier(bootstrap_schema))
+        )
+        cursor.execute(
+            "SELECT rel.relname, con.conname FROM pg_constraint AS con "
+            "JOIN pg_class AS rel ON rel.oid = con.conrelid "
+            "JOIN pg_namespace AS ns ON ns.oid = rel.relnamespace "
+            "WHERE ns.nspname = current_schema() AND NOT con.convalidated"
+        )
+        bootstrap_unvalidated = {tuple(row.values()) for row in cursor.fetchall()}
+        cursor.execute(
+            sql.SQL("SET search_path TO {}").format(sql.Identifier(migration_schema))
+        )
+        cursor.execute(
+            "SELECT rel.relname, con.conname FROM pg_constraint AS con "
+            "JOIN pg_class AS rel ON rel.oid = con.conrelid "
+            "JOIN pg_namespace AS ns ON ns.oid = rel.relnamespace "
+            "WHERE ns.nspname = current_schema() AND NOT con.convalidated"
+        )
+        migration_unvalidated = {tuple(row.values()) for row in cursor.fetchall()}
+    expected_unvalidated = {
+        ("odds_history", "ck_odds_synthetic_source"),
+        ("matches", "ck_completed_matches_decisive"),
+        ("matches", "ck_matches_synthetic_source"),
+    }
+    assert bootstrap_unvalidated == expected_unvalidated
+    assert migration_unvalidated == expected_unvalidated
+    with conn.cursor() as cursor:
+        cursor.execute(
+            sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(bootstrap_schema))
+        )
+        cursor.execute(
+            sql.SQL("SET search_path TO {}").format(sql.Identifier(migration_schema))
+        )
+
+
 def test_canonical_index_migration_failure_keeps_duplicate_rows(
     migrated_connection,
 ):
@@ -488,3 +633,90 @@ def test_prediction_snapshot_reconciliation_and_score_correction(migrated_connec
             (created["id"],),
         )
         assert cursor.fetchone()["count"] == 2
+
+
+def test_prediction_evaluation_retraction_and_recompletion_are_audited(
+    migrated_connection,
+):
+    conn = migrated_connection
+    suffix = uuid4().hex[:10]
+    home, away = f"retract-home-{suffix}", f"retract-away-{suffix}"
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO players (handle) VALUES (%s), (%s) RETURNING id, handle",
+            (home, away),
+        )
+        player_ids = {row["handle"]: row["id"] for row in cursor.fetchall()}
+        cursor.execute(
+            """
+            INSERT INTO matches (match_time, home_player_id, away_player_id, status)
+            VALUES (CURRENT_TIMESTAMP + INTERVAL '1 day', %s, %s, 'scheduled')
+            RETURNING id
+            """,
+            (player_ids[home], player_ids[away]),
+        )
+        match_id = cursor.fetchone()["id"]
+
+    snapshot = create_prediction(
+        conn,
+        match_id=match_id,
+        prediction_run_id=uuid4(),
+        predicted_winner=home,
+        supporting_statistics={"fixture": "snapshot"},
+        sample_size=8,
+        evidence_strength="medium",
+        method_version="descriptive-v1",
+    )
+    prediction_id = snapshot["id"]
+
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "UPDATE matches SET status = 'completed', home_score = 90, away_score = 80 WHERE id = %s",
+            (match_id,),
+        )
+    assert reconcile_predictions(conn, match_id=match_id)["correct"] == 1
+
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "UPDATE matches SET home_score = 70, away_score = 80 WHERE id = %s",
+            (match_id,),
+        )
+    assert reconcile_predictions(conn, match_id=match_id)["incorrect"] == 1
+
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "UPDATE matches SET status = 'scheduled', home_score = NULL, away_score = NULL WHERE id = %s",
+            (match_id,),
+        )
+    retracted = reconcile_predictions(conn, match_id=match_id)
+    assert retracted["retracted"] == 1
+    assert retracted["pending"] == 1
+    current = list_predictions(conn, pending_only=True)
+    assert len([row for row in current if row["id"] == prediction_id]) == 1
+    metrics = prediction_performance(conn)
+    assert metrics["evaluated_predictions"] == 0
+    assert metrics["pending_predictions"] == 1
+    assert metrics["accuracy"] is None
+
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "UPDATE matches SET status = 'completed', home_score = 88, away_score = 80 WHERE id = %s",
+            (match_id,),
+        )
+    final = reconcile_predictions(conn, match_id=match_id)
+    assert final["correct"] == 1
+    assert reconcile_predictions(conn, match_id=match_id)["unchanged"] == 1
+
+    history = list_prediction_evaluation_history(conn, prediction_id=prediction_id)
+    assert [row["event_status"] for row in history] == [
+        "correct",
+        "incorrect",
+        "unable_to_evaluate",
+        "correct",
+    ]
+    assert [row["is_current"] for row in history] == [False, False, False, True]
+    assert history[2]["result_status"] == "scheduled"
+    assert {row["method_version"] for row in history} == {"descriptive-v1"}
+    metrics = prediction_performance(conn)
+    assert metrics["evaluated_predictions"] == 1
+    assert metrics["correct_predictions"] == 1

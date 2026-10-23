@@ -9,9 +9,14 @@ from typing import Any
 
 from psycopg2.extensions import connection as Connection
 
+from ebasketball.constants import FIXTURE_MATCH_TOLERANCE_SECONDS
 from ebasketball.repositories.players import get_or_create_player
 
 VALID_SOURCES = {"h2hgg", "aceodds", "manual", "synthetic"}
+
+
+class AmbiguousFixtureMatchError(ValueError):
+    """Raised when a fixture could match multiple stored fixtures."""
 
 
 def validate_fixture(fixture: dict, source: str) -> None:
@@ -248,6 +253,14 @@ def upsert_match(
     home_id = get_or_create_player(conn, home_handle, fixture.get("home_team"))
     away_id = get_or_create_player(conn, away_handle, fixture.get("away_team"))
 
+    # Serialize candidate resolution for this unordered player pair. A lock
+    # collision only causes extra serialization; it cannot merge fixtures.
+    player_pair = ":".join(str(value) for value in sorted((home_id, away_id)))
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (player_pair,)
+        )
+
     is_synthetic = source == "synthetic"
 
     if raw_hash is None and fixture.get("raw_data") is not None:
@@ -284,6 +297,65 @@ def upsert_match(
                 or source_updated_at > previous_source["source_updated_at"]
             )
         )
+
+    # Resolve slight cross-run kickoff differences using the same bounded
+    # tolerance as in-memory reconciliation. Multiple candidates are unsafe:
+    # leave them distinct and make the caller report the ambiguity.
+    if previous_source is None:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, match_time, home_player_id, away_player_id
+                FROM matches
+                WHERE is_synthetic = %s
+                  AND EXISTS (
+                      SELECT 1 FROM match_sources AS corroborating_source
+                      WHERE corroborating_source.match_id = matches.id
+                        AND corroborating_source.source <> %s
+                  )
+                  AND ((home_player_id = %s AND away_player_id = %s)
+                       OR (home_player_id = %s AND away_player_id = %s))
+                  AND match_time BETWEEN %s - (%s * INTERVAL '1 second')
+                                     AND %s + (%s * INTERVAL '1 second')
+                ORDER BY match_time, id
+                FOR UPDATE
+                """,
+                (
+                    is_synthetic,
+                    source,
+                    home_id,
+                    away_id,
+                    away_id,
+                    home_id,
+                    fixture["match_time"],
+                    FIXTURE_MATCH_TOLERANCE_SECONDS,
+                    fixture["match_time"],
+                    FIXTURE_MATCH_TOLERANCE_SECONDS,
+                ),
+            )
+            candidates = cursor.fetchall()
+        if len(candidates) > 1:
+            raise AmbiguousFixtureMatchError(
+                "Fixture matches multiple stored candidates within "
+                f"{FIXTURE_MATCH_TOLERANCE_SECONDS} seconds"
+            )
+        if candidates:
+            candidate = candidates[0]
+            if (home_id, away_id) == (
+                candidate["away_player_id"],
+                candidate["home_player_id"],
+            ):
+                for left, right in (
+                    ("home_handle", "away_handle"),
+                    ("home_team", "away_team"),
+                    ("home_score", "away_score"),
+                ):
+                    fixture[left], fixture[right] = (
+                        fixture.get(right),
+                        fixture.get(left),
+                    )
+                home_id, away_id = away_id, home_id
+            fixture["match_time"] = candidate["match_time"]
 
     if previous_source is not None:
         prior_home = previous_source["home_player_id"]
@@ -338,6 +410,8 @@ def upsert_match(
                     EXCLUDED.away_team, matches.away_team
                 ),
                 status = CASE
+                    WHEN %(allow_score_correction)s
+                        THEN EXCLUDED.status
                     WHEN matches.status = 'completed'
                         THEN matches.status
                     WHEN EXCLUDED.status = 'completed'
@@ -345,12 +419,16 @@ def upsert_match(
                     ELSE EXCLUDED.status
                 END,
                 home_score = CASE
+                    WHEN %(allow_score_correction)s
+                        THEN EXCLUDED.home_score
                     WHEN matches.home_score IS NULL
                       OR (%(allow_score_correction)s AND EXCLUDED.status = 'completed')
                         THEN COALESCE(EXCLUDED.home_score, matches.home_score)
                     ELSE matches.home_score
                 END,
                 away_score = CASE
+                    WHEN %(allow_score_correction)s
+                        THEN EXCLUDED.away_score
                     WHEN matches.away_score IS NULL
                       OR (%(allow_score_correction)s AND EXCLUDED.status = 'completed')
                         THEN COALESCE(EXCLUDED.away_score, matches.away_score)

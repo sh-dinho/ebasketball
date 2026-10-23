@@ -6,7 +6,9 @@ from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from typing import Any
 
-DEFAULT_TIME_TOLERANCE_SECONDS = 300
+from ebasketball.constants import FIXTURE_MATCH_TOLERANCE_SECONDS
+
+DEFAULT_TIME_TOLERANCE_SECONDS = FIXTURE_MATCH_TOLERANCE_SECONDS
 
 
 def _normalize_handle(value: Any) -> str:
