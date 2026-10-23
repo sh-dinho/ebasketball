@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from hashlib import sha256
 import json
+from typing import Any
 
 from psycopg2.extensions import connection as Connection
 
@@ -129,33 +130,35 @@ def _record_source(
                 ),
             )
         else:
-            # Without an external ID, update an existing mapping when
-            # the stable source-specific match key is available.
-            cursor.execute(
-                """
-                SELECT id
-                FROM match_sources
-                WHERE match_id = %s
-                  AND source = %s
-                  AND source_match_key = %s
-                LIMIT 1
-                """,
-                (match_id, source, source_match_key),
-            )
-
-            existing = cursor.fetchone()
-
-            if existing:
+            if source_match_key is None:
                 cursor.execute(
                     """
-                    UPDATE match_sources
-                    SET source_url = COALESCE(%s, source_url),
-                        raw_hash = COALESCE(%s, raw_hash),
+                    INSERT INTO match_sources (
+                        match_id, source, source_url,
+                        source_match_key, raw_hash,
+                        first_seen_at, last_seen_at, last_checked_at
+                    )
+                    VALUES (
+                        %s, %s, %s, NULL, %s,
+                        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
+                        CURRENT_TIMESTAMP
+                    )
+                    ON CONFLICT (match_id, source)
+                        WHERE source_event_id IS NULL
+                          AND source_match_key IS NULL
+                    DO UPDATE SET
+                        source_url = COALESCE(
+                            EXCLUDED.source_url,
+                            match_sources.source_url
+                        ),
+                        raw_hash = COALESCE(
+                            EXCLUDED.raw_hash,
+                            match_sources.raw_hash
+                        ),
                         last_seen_at = CURRENT_TIMESTAMP,
                         last_checked_at = CURRENT_TIMESTAMP
-                    WHERE id = %s
                     """,
-                    (source_url, raw_hash, existing["id"]),
+                    (match_id, source, source_url, raw_hash),
                 )
             else:
                 cursor.execute(
@@ -170,6 +173,18 @@ def _record_source(
                         CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
                         CURRENT_TIMESTAMP
                     )
+                    ON CONFLICT (match_id, source, source_match_key)
+                    DO UPDATE SET
+                        source_url = COALESCE(
+                            EXCLUDED.source_url,
+                            match_sources.source_url
+                        ),
+                        raw_hash = COALESCE(
+                            EXCLUDED.raw_hash,
+                            match_sources.raw_hash
+                        ),
+                        last_seen_at = CURRENT_TIMESTAMP,
+                        last_checked_at = CURRENT_TIMESTAMP
                     """,
                     (
                         match_id, source, source_url,
@@ -187,7 +202,8 @@ def upsert_match(
     source_url: str | None = None,
     source_match_key: str | None = None,
     raw_hash: str | None = None,
-) -> int:
+    return_status: bool = False,
+) -> int | dict[str, Any]:
     """
     Insert or update a fixture and its source mapping.
 
@@ -302,7 +318,7 @@ def upsert_match(
                 is_synthetic = matches.is_synthetic
                     AND EXCLUDED.is_synthetic,
                 updated_at = CURRENT_TIMESTAMP
-            RETURNING id
+            RETURNING id, (xmax = 0) AS inserted
             """,
             {
                 **values,
@@ -319,7 +335,8 @@ def upsert_match(
             },
         )
 
-        match_id = cursor.fetchone()["id"]
+        result = cursor.fetchone()
+        match_id = result["id"]
 
     _record_source(
         conn,
@@ -331,4 +348,6 @@ def upsert_match(
         raw_hash,
     )
 
+    if return_status:
+        return {"id": match_id, "inserted": bool(result["inserted"])}
     return match_id

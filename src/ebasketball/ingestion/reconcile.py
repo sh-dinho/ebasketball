@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any, Iterable, Mapping
-
+from collections.abc import Iterable, Mapping
+from datetime import datetime, timezone
+from typing import Any
 
 DEFAULT_TIME_TOLERANCE_SECONDS = 300
 
@@ -22,7 +22,7 @@ def _utc_time(value: Any) -> datetime:
     from datetime import timezone
 
     if not isinstance(value, datetime):
-        raise ValueError("match_time must be a datetime")
+        raise TypeError("match_time must be a datetime")
 
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("match_time must be timezone-aware")
@@ -46,6 +46,15 @@ def _fixture_identity(
     return home, away
 
 
+def _validate_tolerance(tolerance_seconds: int) -> None:
+    """Validate the allowed kickoff-time difference."""
+    if isinstance(tolerance_seconds, bool) or not isinstance(tolerance_seconds, int):
+        raise TypeError("tolerance_seconds must be an integer")
+
+    if tolerance_seconds < 0:
+        raise ValueError("tolerance_seconds cannot be negative")
+
+
 def fixtures_match(
     first: Mapping[str, Any],
     second: Mapping[str, Any],
@@ -58,8 +67,7 @@ def fixtures_match(
     Home and away positions must match. Kickoff times may differ by up
     to tolerance_seconds. This function does not mutate either record.
     """
-    if tolerance_seconds < 0:
-        raise ValueError("tolerance_seconds cannot be negative")
+    _validate_tolerance(tolerance_seconds)
 
     if _fixture_identity(first) != _fixture_identity(second):
         return False
@@ -67,10 +75,7 @@ def fixtures_match(
     first_time = _utc_time(first.get("match_time"))
     second_time = _utc_time(second.get("match_time"))
 
-    return (
-        abs((first_time - second_time).total_seconds())
-        <= tolerance_seconds
-    )
+    return abs((first_time - second_time).total_seconds()) <= tolerance_seconds
 
 
 def reconcile_fixtures(
@@ -83,17 +88,15 @@ def reconcile_fixtures(
 
     The result contains:
       - groups: groups of records believed to represent one fixture
-      - unmatched: records that could not be matched
+      - unmatched: records that could not be matched to another source
       - ambiguous: records matching more than one existing group
 
     Input order is preserved. No source record is silently discarded.
     Each group contains the original fixture mappings.
     """
-    if tolerance_seconds < 0:
-        raise ValueError("tolerance_seconds cannot be negative")
+    _validate_tolerance(tolerance_seconds)
 
     groups: list[dict[str, Any]] = []
-    unmatched: list[dict[str, Any]] = []
     ambiguous: list[dict[str, Any]] = []
 
     for source, records in fixtures_by_source.items():
@@ -108,7 +111,7 @@ def reconcile_fixtures(
                 "fixture": fixture,
             }
 
-            # Validate identity and timestamp before attempting matching.
+            # Validate identity and timestamp before matching.
             _fixture_identity(fixture)
             _utc_time(fixture.get("match_time"))
 
@@ -116,10 +119,13 @@ def reconcile_fixtures(
                 group
                 for group in groups
                 if source_name not in group["sources"]
-                and fixtures_match(
-                    fixture,
-                    group["records"][0]["fixture"],
-                    tolerance_seconds=tolerance_seconds,
+                and any(
+                    fixtures_match(
+                        fixture,
+                        existing["fixture"],
+                        tolerance_seconds=tolerance_seconds,
+                    )
+                    for existing in group["records"]
                 )
             ]
 
@@ -132,14 +138,13 @@ def reconcile_fixtures(
                 candidates[0]["sources"].add(source_name)
                 continue
 
-            # Do not combine multiple fixtures from the same source.
-            # A later source can still match this candidate.
-            groups.append({
-                "records": [record],
-                "sources": {source_name},
-            })
+            groups.append(
+                {
+                    "records": [record],
+                    "sources": {source_name},
+                }
+            )
 
-    # Expose ordinary serializable source lists rather than sets.
     normalized_groups = [
         {
             "records": group["records"],
@@ -147,6 +152,8 @@ def reconcile_fixtures(
         }
         for group in groups
     ]
+
+    unmatched = [group["records"][0] for group in groups if len(group["records"]) == 1]
 
     return {
         "groups": normalized_groups,

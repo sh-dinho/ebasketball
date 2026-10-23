@@ -21,7 +21,8 @@ class Settings:
     db_connect_timeout: int
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls) -> Settings:
+        """Load and validate settings from environment variables."""
         password = os.getenv("DB_PASSWORD")
 
         if not password:
@@ -55,4 +56,5 @@ class Settings:
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    """Return the cached application settings."""
     return Settings.from_env()

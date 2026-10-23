@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Any, Iterator
 
 import psycopg2
 from psycopg2.extensions import connection as Connection
@@ -30,8 +30,7 @@ def connect() -> Connection:
 
 @contextmanager
 def get_connection() -> Iterator[Connection]:
-    """
-    Open a connection and transaction.
+    """Open a connection and transaction.
 
     Commit on success, roll back on failure, and always close.
     """
@@ -47,7 +46,7 @@ def get_connection() -> Iterator[Connection]:
         conn.close()
 
 
-def check_database() -> dict:
+def check_database() -> dict[str, Any]:
     """Return basic connectivity and database identity information."""
     with get_connection() as conn:
         with conn.cursor() as cursor:

@@ -1,0 +1,17 @@
+
+[
+  {
+    "match_time": "2026-10-24T18:00:00Z",
+    "home_handle": "TEST_PLAYER_A",
+    "away_handle": "TEST_PLAYER_B",
+    "home_team": "TEST_PLAYER_A",
+    "away_team": "TEST_PLAYER_B",
+    "status": "scheduled",
+    "home_score": null,
+    "away_score": null,
+    "home_moneyline": 1.91,
+    "away_moneyline": 1.95,
+    "source_event_id": "test-event-001",
+    "source_url": "https://example.com/test-event-001"
+  }
+]

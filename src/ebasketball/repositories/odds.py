@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Iterable
 
@@ -51,11 +52,20 @@ def _normalize_observation(item: dict) -> dict:
     if line is not None:
         line = _decimal(line, "line").quantize(Decimal("0.01"))
 
+    observed_at = item.get("observed_at")
+    if observed_at is not None and (
+        not isinstance(observed_at, datetime)
+        or observed_at.tzinfo is None
+        or observed_at.utcoffset() is None
+    ):
+        raise ValueError("observed_at must be a timezone-aware datetime.")
+
     return {
         "market_type": market,
         "outcome": outcome,
         "line": line,
         "odds": odds,
+        "observed_at": observed_at,
     }
 
 
@@ -83,6 +93,33 @@ def record_odds(
         item = _normalize_observation(raw_item)
 
         with conn.cursor() as cursor:
+            if item["observed_at"] is not None:
+                cursor.execute(
+                    """
+                    SELECT 1
+                    FROM odds_history
+                    WHERE match_id = %s
+                      AND market_type = %s
+                      AND outcome = %s
+                      AND source = %s
+                      AND observed_at = %s
+                      AND line IS NOT DISTINCT FROM %s
+                      AND odds = %s
+                    LIMIT 1
+                    """,
+                    (
+                        match_id,
+                        item["market_type"],
+                        item["outcome"],
+                        source,
+                        item["observed_at"],
+                        item["line"],
+                        item["odds"],
+                    ),
+                )
+                if cursor.fetchone() is not None:
+                    continue
+
             cursor.execute(
                 """
                 SELECT odds, line
@@ -115,9 +152,10 @@ def record_odds(
                 """
                 INSERT INTO odds_history (
                     match_id, market_type, outcome, line,
-                    odds, source, is_synthetic
+                    odds, source, is_synthetic, observed_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s,
+                        COALESCE(%s, CURRENT_TIMESTAMP))
                 """,
                 (
                     match_id,
@@ -127,6 +165,7 @@ def record_odds(
                     item["odds"],
                     source,
                     source == "synthetic",
+                    item["observed_at"],
                 ),
             )
 
@@ -143,36 +182,42 @@ def observations_from_fixture(fixture: dict) -> list[dict]:
             "outcome": "home",
             "line": None,
             "odds": fixture.get("home_moneyline"),
+            "observed_at": fixture.get("odds_observed_at"),
         },
         {
             "market_type": "moneyline",
             "outcome": "away",
             "line": None,
             "odds": fixture.get("away_moneyline"),
+            "observed_at": fixture.get("odds_observed_at"),
         },
         {
             "market_type": "spread",
             "outcome": "home",
             "line": fixture.get("spread_line"),
             "odds": fixture.get("home_spread_odds"),
+            "observed_at": fixture.get("odds_observed_at"),
         },
         {
             "market_type": "spread",
             "outcome": "away",
             "line": fixture.get("away_spread_line"),
             "odds": fixture.get("away_spread_odds"),
+            "observed_at": fixture.get("odds_observed_at"),
         },
         {
             "market_type": "total",
             "outcome": "over",
             "line": fixture.get("total_line"),
             "odds": fixture.get("over_odds"),
+            "observed_at": fixture.get("odds_observed_at"),
         },
         {
             "market_type": "total",
             "outcome": "under",
             "line": fixture.get("total_line"),
             "odds": fixture.get("under_odds"),
+            "observed_at": fixture.get("odds_observed_at"),
         },
     ]
 

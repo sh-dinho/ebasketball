@@ -101,14 +101,32 @@ def test_missing_scores_remain_none(raw_fixture):
     assert result["away_score"] is None
 
 
-def test_scores_are_parsed_without_fabrication(raw_fixture):
+def test_scores_are_parsed_as_integers_without_fabrication(raw_fixture):
     raw_fixture["home_score"] = "105"
     raw_fixture["away_score"] = 98
 
     result = normalize_fixture(raw_fixture, "h2hgg")
 
-    assert result["home_score"] == Decimal("105")
-    assert result["away_score"] == Decimal("98")
+    assert result["home_score"] == 105
+    assert result["away_score"] == 98
+    assert isinstance(result["home_score"], int)
+    assert isinstance(result["away_score"], int)
+
+
+@pytest.mark.parametrize("bad_score", ["-1", -1])
+def test_negative_scores_are_rejected(raw_fixture, bad_score):
+    raw_fixture["home_score"] = bad_score
+
+    with pytest.raises(ValueError, match="cannot be negative"):
+        normalize_fixture(raw_fixture, "h2hgg")
+
+
+@pytest.mark.parametrize("fractional_score", ["105.5", 105.5, Decimal("105.5")])
+def test_fractional_scores_are_rejected(raw_fixture, fractional_score):
+    raw_fixture["home_score"] = fractional_score
+
+    with pytest.raises(ValueError, match="whole numbers"):
+        normalize_fixture(raw_fixture, "h2hgg")
 
 
 def test_self_match_is_rejected(raw_fixture):

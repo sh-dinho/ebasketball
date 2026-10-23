@@ -1,15 +1,15 @@
-
 """Normalize source records into a shared eBasketball fixture format."""
 
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from datetime import date, datetime, time, timezone
 from decimal import Decimal, InvalidOperation
 from math import isfinite
-from typing import Any, Mapping
+from typing import Any
+from urllib.parse import urljoin, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
 
 DEFAULT_SOURCE_TIMEZONE = "America/Denver"
 
@@ -25,11 +25,18 @@ FIELD_ALIASES = {
     "source_event_id": (
         "source_event_id",
         "event_id",
+        "externalId",
         "fixture_id",
         "match_id",
         "eventId",
         "fixtureId",
         "id",
+    ),
+    "source_match_key": (
+        "source_match_key",
+        "source_event_key",
+        "external_match_key",
+        "match_key",
     ),
     "match_time": (
         "match_time",
@@ -39,6 +46,12 @@ FIELD_ALIASES = {
         "datetime",
         "date_time",
         "startTime",
+        "startDate",
+    ),
+    "odds_observed_at": (
+        "odds_observed_at",
+        "odds_timestamp",
+        "observed_at",
     ),
     "home_handle": (
         "home_handle",
@@ -48,6 +61,7 @@ FIELD_ALIASES = {
         "home",
         "player1",
         "participant1",
+        "participantAName",
     ),
     "away_handle": (
         "away_handle",
@@ -57,35 +71,13 @@ FIELD_ALIASES = {
         "away",
         "player2",
         "participant2",
+        "participantBName",
     ),
-    "home_team": (
-        "home_team",
-        "home_name",
-        "home",
-        "home_handle",
-    ),
-    "away_team": (
-        "away_team",
-        "away_name",
-        "away",
-        "away_handle",
-    ),
-    "status": (
-        "status",
-        "match_status",
-        "event_status",
-        "state",
-    ),
-    "home_score": (
-        "home_score",
-        "score_home",
-        "homeScore",
-    ),
-    "away_score": (
-        "away_score",
-        "score_away",
-        "awayScore",
-    ),
+    "home_team": ("home_team", "home_name", "home", "home_handle", "teamAName"),
+    "away_team": ("away_team", "away_name", "away", "away_handle", "teamBName"),
+    "status": ("status", "match_status", "event_status", "state", "matchStatus"),
+    "home_score": ("home_score", "score_home", "homeScore", "teamAScore"),
+    "away_score": ("away_score", "score_away", "awayScore", "teamBScore"),
     "home_moneyline": (
         "home_moneyline",
         "home_ml",
@@ -98,45 +90,19 @@ FIELD_ALIASES = {
         "away_odds",
         "odds_away",
     ),
-    "spread_line": (
-        "spread_line",
-        "home_spread",
-        "handicap_home",
-    ),
+    "spread_line": ("spread_line", "home_spread", "handicap_home"),
     "away_spread_line": (
         "away_spread_line",
         "away_spread",
         "handicap_away",
     ),
-    "home_spread_odds": (
-        "home_spread_odds",
-        "home_handicap_odds",
-    ),
-    "away_spread_odds": (
-        "away_spread_odds",
-        "away_handicap_odds",
-    ),
-    "total_line": (
-        "total_line",
-        "over_under",
-        "totals_line",
-    ),
-    "over_odds": (
-        "over_odds",
-        "odds_over",
-    ),
-    "under_odds": (
-        "under_odds",
-        "odds_under",
-    ),
-    "source_url": (
-        "source_url",
-        "event_url",
-        "url",
-        "link",
-    ),
+    "home_spread_odds": ("home_spread_odds", "home_handicap_odds"),
+    "away_spread_odds": ("away_spread_odds", "away_handicap_odds"),
+    "total_line": ("total_line", "over_under", "totals_line"),
+    "over_odds": ("over_odds", "odds_over"),
+    "under_odds": ("under_odds", "odds_under"),
+    "source_url": ("source_url", "event_url", "url", "link"),
 }
-
 
 STATUS_ALIASES = {
     "scheduled": "scheduled",
@@ -154,6 +120,7 @@ STATUS_ALIASES = {
     "half time": "live",
     "halftime": "live",
     "finished": "completed",
+    "match ended": "completed",
     "finish": "completed",
     "complete": "completed",
     "completed": "completed",
@@ -164,7 +131,7 @@ STATUS_ALIASES = {
     "cancelled": "cancelled",
     "canceled": "cancelled",
     "postponed": "postponed",
-    "abandoned": "abandoned",
+    "abandoned": "unknown",
 }
 
 
@@ -209,6 +176,14 @@ def _first(
     return None
 
 
+def _is_true(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    return str(value).strip().casefold() in {"true", "yes", "1"}
+
+
 def _decimal(
     value: Any,
     *,
@@ -227,7 +202,6 @@ def _decimal(
     if text is None:
         return None
 
-    # Avoid interpreting thousands separators as decimal separators.
     text = text.replace(",", "")
 
     try:
@@ -256,21 +230,31 @@ def _odds(value: Any) -> Decimal | None:
     )
 
 
-def _score(value: Any) -> Decimal | None:
-    """Scores may be zero but cannot be negative."""
-    return _decimal(
-        value,
-        minimum=Decimal("0"),
-        maximum=Decimal("100000"),
-    )
+def _score(value: Any) -> int | None:
+    """Parse scores as nonnegative whole numbers without truncation."""
+    score = _decimal(value)
+
+    if score is None:
+        return None
+
+    if score < 0:
+        raise ValueError("Scores cannot be negative.")
+
+    if score != score.to_integral_value():
+        raise ValueError("Scores must be whole numbers.")
+
+    if score > Decimal(100000):
+        return None
+
+    return int(score)
 
 
 def _line(value: Any) -> Decimal | None:
     """Handicap and total lines may be positive or negative."""
     return _decimal(
         value,
-        minimum=Decimal("-100000"),
-        maximum=Decimal("100000"),
+        minimum=Decimal(-100000),
+        maximum=Decimal(100000),
     )
 
 
@@ -296,54 +280,41 @@ def normalize_match_time(
     source_timezone: str = DEFAULT_SOURCE_TIMEZONE,
     board_date: date | None = None,
 ) -> datetime:
-    """
-    Parse a match timestamp and return a UTC-aware datetime.
+    """Parse a match timestamp and return a UTC-aware datetime.
 
     Naive datetimes are interpreted in source_timezone.
-
     Time-only values require board_date.
-
     Numeric values are Unix timestamps in seconds, or milliseconds
     when their magnitude indicates milliseconds.
     """
     try:
         source_tz = ZoneInfo(source_timezone)
     except (ZoneInfoNotFoundError, ValueError) as exc:
-        raise ValueError(
-            f"Invalid source timezone: {source_timezone!r}"
-        ) from exc
+        raise ValueError(f"Invalid source timezone: {source_timezone!r}") from exc
 
     if isinstance(value, bool):
-        raise ValueError("Boolean values are not valid match timestamps")
+        raise TypeError("Boolean values are not valid match timestamps")
 
     if isinstance(value, datetime):
         parsed = value
 
     elif isinstance(value, time):
         if board_date is None:
-            raise ValueError(
-                "board_date is required for time-only match times"
-            )
+            raise ValueError("board_date is required for time-only match times")
 
         parsed = datetime.combine(board_date, value)
 
     elif isinstance(value, date):
-        raise ValueError(
-            "A date without a time is not a complete match timestamp"
-        )
+        raise TypeError("A date without a time is not a complete match timestamp")
 
     elif isinstance(value, (int, float, Decimal)):
         try:
             timestamp = float(value)
         except (ValueError, OverflowError) as exc:
-            raise ValueError(
-                f"Invalid numeric match timestamp: {value!r}"
-            ) from exc
+            raise ValueError(f"Invalid numeric match timestamp: {value!r}") from exc
 
         if not isfinite(timestamp):
-            raise ValueError(
-                f"Invalid numeric match timestamp: {value!r}"
-            )
+            raise ValueError(f"Invalid numeric match timestamp: {value!r}")
 
         if abs(timestamp) >= 100_000_000_000:
             timestamp /= 1000
@@ -354,9 +325,7 @@ def normalize_match_time(
                 tz=timezone.utc,
             )
         except (ValueError, OverflowError, OSError) as exc:
-            raise ValueError(
-                f"Match timestamp is out of range: {value!r}"
-            ) from exc
+            raise ValueError(f"Match timestamp is out of range: {value!r}") from exc
 
     elif isinstance(value, str):
         text = value.strip()
@@ -364,11 +333,7 @@ def normalize_match_time(
         if not text:
             raise ValueError("Match timestamp cannot be empty")
 
-        iso_text = (
-            text[:-1] + "+00:00"
-            if text.endswith(("Z", "z"))
-            else text
-        )
+        iso_text = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
 
         try:
             parsed = datetime.fromisoformat(iso_text)
@@ -391,30 +356,57 @@ def normalize_match_time(
                 "%I:%M:%S %p",
             ):
                 try:
-                    parsed_time = datetime.strptime(
-                        text,
-                        fmt,
-                    ).time()
+                    parsed_time = datetime.strptime(text, fmt).time()
                     break
                 except ValueError:
                     continue
 
             if parsed_time is None:
-                raise ValueError(
-                    f"Unrecognized match timestamp: {value!r}"
-                )
+                raise ValueError(f"Unrecognized match timestamp: {value!r}")
 
             parsed = datetime.combine(board_date, parsed_time)
 
     else:
-        raise ValueError(
-            f"Unsupported match timestamp: {value!r}"
-        )
+        raise TypeError(f"Unsupported match timestamp type: {type(value).__name__}")
 
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         parsed = parsed.replace(tzinfo=source_tz)
 
     return parsed.astimezone(timezone.utc)
+
+
+def _resolve_source_url(
+    value: Any,
+    *,
+    base_url: str | None = None,
+) -> str | None:
+    """Resolve a source URL and require a valid HTTP(S) address."""
+    text = _clean_text(value)
+
+    if text is None:
+        return None
+
+    if base_url:
+        text = urljoin(base_url, text)
+
+    try:
+        parts = urlsplit(text)
+
+        if parts.scheme.casefold() not in {"http", "https"}:
+            return None
+
+        if not parts.hostname:
+            return None
+
+        if parts.username is not None or parts.password is not None:
+            return None
+
+        _ = parts.port
+
+    except ValueError:
+        return None
+
+    return text
 
 
 def normalize_fixture(
@@ -425,8 +417,7 @@ def normalize_fixture(
     source_timezone: str = DEFAULT_SOURCE_TIMEZONE,
     board_date: date | None = None,
 ) -> dict[str, Any]:
-    """
-    Convert a source record into the shared fixture format.
+    """Convert a source record into the shared fixture format.
 
     This function is pure: it does not scrape websites, connect to
     PostgreSQL, or fabricate odds, scores, or event identifiers.
@@ -442,12 +433,11 @@ def normalize_fixture(
     source_name = source_name.casefold()
 
     if source_name not in SOURCE_URLS:
-        raise ValueError(
-            f"Unsupported fixture source: {source!r}"
-        )
+        raise ValueError(f"Unsupported fixture source: {source!r}")
 
-    event_id = _clean_text(
-        _first(raw, FIELD_ALIASES["source_event_id"])
+    event_id = _clean_text(_first(raw, FIELD_ALIASES["source_event_id"]))
+    source_match_key = _clean_text(
+        _first(raw, FIELD_ALIASES["source_match_key"])
     )
 
     raw_time = _first(raw, FIELD_ALIASES["match_time"])
@@ -461,82 +451,62 @@ def normalize_fixture(
         board_date=board_date,
     )
 
-    home_handle = _clean_text(
-        _first(raw, FIELD_ALIASES["home_handle"])
+    raw_observed_at = _first(raw, FIELD_ALIASES["odds_observed_at"])
+    odds_observed_at = (
+        normalize_match_time(
+            raw_observed_at,
+            source_timezone=source_timezone,
+            board_date=board_date,
+        )
+        if raw_observed_at is not None
+        else None
     )
-    away_handle = _clean_text(
-        _first(raw, FIELD_ALIASES["away_handle"])
-    )
+
+    home_handle = _clean_text(_first(raw, FIELD_ALIASES["home_handle"]))
+    away_handle = _clean_text(_first(raw, FIELD_ALIASES["away_handle"]))
 
     if home_handle is None or away_handle is None:
-        raise ValueError(
-            "Both home_handle and away_handle are required"
-        )
+        raise ValueError("Both home_handle and away_handle are required")
 
     if home_handle.casefold() == away_handle.casefold():
-        raise ValueError(
-            "Home and away handles must differ"
-        )
+        raise ValueError("Home and away handles must differ")
 
-    home_team = _clean_text(
-        _first(raw, FIELD_ALIASES["home_team"])
-    )
-    away_team = _clean_text(
-        _first(raw, FIELD_ALIASES["away_team"])
-    )
+    home_team = _clean_text(_first(raw, FIELD_ALIASES["home_team"]))
+    away_team = _clean_text(_first(raw, FIELD_ALIASES["away_team"]))
+    raw_status = _first(raw, FIELD_ALIASES["status"])
+    if source_name == "h2hgg" and _is_true(raw.get("isCancelled")):
+        raw_status = "cancelled"
 
-    # Prefer a real event URL over the schedule-page fallback.
     resolved_url = (
-        _clean_text(
-            _first(raw, FIELD_ALIASES["source_url"])
+        _resolve_source_url(
+            _first(raw, FIELD_ALIASES["source_url"]),
+            base_url=source_url or SOURCE_URLS[source_name],
         )
-        or _clean_text(source_url)
+        or _resolve_source_url(source_url)
         or SOURCE_URLS[source_name]
     )
 
     return {
         "match_time": match_time,
+        "odds_observed_at": odds_observed_at,
         "home_handle": home_handle,
         "away_handle": away_handle,
         "home_team": home_team or home_handle,
         "away_team": away_team or away_handle,
-        "status": normalize_status(
-            _first(raw, FIELD_ALIASES["status"])
-        ),
-        "home_score": _score(
-            _first(raw, FIELD_ALIASES["home_score"])
-        ),
-        "away_score": _score(
-            _first(raw, FIELD_ALIASES["away_score"])
-        ),
-        "home_moneyline": _odds(
-            _first(raw, FIELD_ALIASES["home_moneyline"])
-        ),
-        "away_moneyline": _odds(
-            _first(raw, FIELD_ALIASES["away_moneyline"])
-        ),
-        "spread_line": _line(
-            _first(raw, FIELD_ALIASES["spread_line"])
-        ),
-        "away_spread_line": _line(
-            _first(raw, FIELD_ALIASES["away_spread_line"])
-        ),
-        "home_spread_odds": _odds(
-            _first(raw, FIELD_ALIASES["home_spread_odds"])
-        ),
-        "away_spread_odds": _odds(
-            _first(raw, FIELD_ALIASES["away_spread_odds"])
-        ),
-        "total_line": _line(
-            _first(raw, FIELD_ALIASES["total_line"])
-        ),
-        "over_odds": _odds(
-            _first(raw, FIELD_ALIASES["over_odds"])
-        ),
-        "under_odds": _odds(
-            _first(raw, FIELD_ALIASES["under_odds"])
-        ),
+        "status": normalize_status(raw_status),
+        "home_score": _score(_first(raw, FIELD_ALIASES["home_score"])),
+        "away_score": _score(_first(raw, FIELD_ALIASES["away_score"])),
+        "home_moneyline": _odds(_first(raw, FIELD_ALIASES["home_moneyline"])),
+        "away_moneyline": _odds(_first(raw, FIELD_ALIASES["away_moneyline"])),
+        "spread_line": _line(_first(raw, FIELD_ALIASES["spread_line"])),
+        "away_spread_line": _line(_first(raw, FIELD_ALIASES["away_spread_line"])),
+        "home_spread_odds": _odds(_first(raw, FIELD_ALIASES["home_spread_odds"])),
+        "away_spread_odds": _odds(_first(raw, FIELD_ALIASES["away_spread_odds"])),
+        "total_line": _line(_first(raw, FIELD_ALIASES["total_line"])),
+        "over_odds": _odds(_first(raw, FIELD_ALIASES["over_odds"])),
+        "under_odds": _odds(_first(raw, FIELD_ALIASES["under_odds"])),
         "data_source": source_name,
         "source_event_id": event_id,
+        "source_match_key": source_match_key,
         "source_url": resolved_url,
     }

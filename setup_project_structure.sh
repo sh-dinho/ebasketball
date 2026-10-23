@@ -26,7 +26,7 @@ create_if_missing() {
     local file="$1"
     local content="$2"
 
-    if [[ -e "$file" ]]; then
+    if [[ -e "$file" || -L "$file" ]]; then
         echo "[KEEP] $file"
         return
     fi
@@ -117,7 +117,7 @@ create_if_missing ".gitignore" \
     '# Secrets
 .env
 .env.*
-!.env
+!.env.example
 
 # Python
 .venv/
